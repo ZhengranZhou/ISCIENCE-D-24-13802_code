@@ -1,0 +1,2155 @@
+---
+params:
+  name: "MRD"
+  full_name: "Fia-Metabolite-Plasma-MRD-MS2"
+  platform: "Fia-Metabolite-Plasma"
+  instrument: "QE_Plus QE_HF" 
+  version: "0.8.0"
+  author: "whoami::email_address()"
+  template_version: "1.4.0"
+
+title: "Data Analysis Report"
+subtitle: "`r paste(gsub('-',' ',params$full_name))`"
+author: "`r eval(parse(text = params$author))`"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    css: "http://172.16.1.71:20001/analysis/assets/1.0.0/analysis_report.css"
+    includes:
+      after_body: "http://172.16.1.71:20001/analysis/assets/1.0.0/analysis_report.html"
+      
+knit: (function(inputFile, encoding, output_dir) { rmarkdown::render(input=inputFile, encoding='UTF-8', output_dir=dirname(inputFile), output_file=paste0(rmarkdown::yaml_front_matter(inputFile)$params$full_name,'_',rmarkdown::yaml_front_matter(inputFile)$params$version,".",gsub("\\.","",rmarkdown::yaml_front_matter(inputFile)$params$template_version), '.html')) })
+---
+
+```{r lib, echo=FALSE, include=FALSE}
+library(knitr)
+library(DT)
+library(OmicsDP)
+library(rgl)
+library(PerformanceAnalytics)
+library(htmltools)
+library(readxl)
+library(xlsx)
+options(stringsAsFactors = F)
+knit_hooks$set(webgl = hook_webgl)
+knitr::opts_chunk$set(comment = NA, fig.align = "center", fig.retina = 2, dev="svg"); fi <- 0
+
+
+model_perf_roc_plot <- function(truth, score, cutoff=NULL, confusion_matrix=T, title=NULL){
+  require(gridExtra)
+  require(grid)
+  
+  dat <- proc_data_convert(truth=truth, score=score)
+  
+  # # roc plot
+  # rocobj <- pROC::roc(cases=dat$cases, controls=dat$controls)
+  # plot(rocobj, main=title, grid=TRUE,percent=TRUE,print.auc=TRUE, print.thres=TRUE)
+  rocobj <- pROC::roc(cases=dat$cases, controls=dat$controls)
+  plot.roc(rocobj, add=F, reuse.auc=TRUE,axes=TRUE, legacy.axes=T,percent=TRUE,print.auc=FALSE, print.thres=FALSE)
+  
+  #auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE) 
+  # print the AUC (will contain the CI)  
+  ciobj <- pROC::ci.se(rocobj, specificities=seq(0, 1, 0.05), progress="none")
+  plot(ciobj, type="shape", col=adjustcolor( "grey", alpha.f = 0.4))
+  # plot(ci(rocobj, of="thresholds", thresholds="best", best.method="topleft", progress="none"))
+  
+  auc_ci <- pROC::ci.auc(cases=dat$cases, controls=dat$controls)
+  text(x = 0.3, y = 0.05, sprintf("AUC: %1.2f (%1.2f-%1.2f)",auc_ci[2],auc_ci[1],auc_ci[3]))
+  
+  # performance calculate
+  ret <- c("threshold", "sensitivity", "specificity","ppv", "npv","tn","tp","fp","fn")
+  threshold <- pROC::coords(rocobj, "best", transpose=T, ret=ret)
+  if(class(threshold)=="matrix"){
+    threshold <- threshold[,1]
+  }
+  
+  if(rocobj$direction=="<"){
+    pred <- ifelse(score>=threshold["threshold"],"Predicted positive","Predicted negative")
+  } else {
+    pred <- ifelse(score<=threshold["threshold"],"Predicted positive","Predicted negative")
+  }
+  confusion_mat <- table(data.frame(Predict=pred,Truth=truth))
+  
+  model_perf <- c(auc=rocobj$auc, threshold)
+  model_perf <- as.data.frame(model_perf); colnames(model_perf) <- "Best"; model_perf <- t(model_perf)
+  
+  if(!is.null(cutoff)){
+    threshold <- as.data.frame(t(pROC::coords(rocobj, "all", transpose=T, ret=ret)))
+    # fix sorting bug
+    idx <- MALDIquant_match_closest(cutoff, sort(threshold$threshold,decreasing = F))
+    threshold <- cbind(auc=rocobj$auc, threshold[nrow(threshold)-idx,,drop=F])
+    rownames(threshold) <- "Transfered"
+    model_perf <- rbind(model_perf, threshold)
+    
+    if(rocobj$direction=="<"){
+      pred <- ifelse(score>=cutoff,"Predicted positive","Predicted negative")
+    } else {
+      pred <- ifelse(score<=cutoff,"Predicted positive","Predicted negative")
+    }
+    confusion_mat1 <- table(data.frame(Predict=pred,Truth=truth))
+    
+    confusion_grob <- gtable_combine(tableGrob(confusion_mat), tableGrob(confusion_mat1), along=1)
+  } else {
+    confusion_grob <- tableGrob(confusion_mat)
+  }
+  
+  if(confusion_matrix)
+    grid.arrange(tableGrob(round(model_perf,3)), confusion_grob, nrow=2)
+  
+  message(paste0(capture.output(knitr::kable(model_perf, format = "pandoc", row.names = T)), collapse = "\n"))
+}
+
+cv_perf_plot_binary <- 
+  function(cv_model, build="1.0.0", roc_plot=T, confusion_matrix_plot=T, feature_plot=T, density_plot=T, fig_legend=F){
+  if(build=="1.0.0"){
+    pred_dat <- cv_model$data$density
+    m <- cv_model$model
+  } else if(build=="2.0.1"){
+    pred_dat <- cv_model$modelCore[[1]]$data$prediction$data
+    colnames(pred_dat)[colnames(pred_dat)=="predictedValue"] <- "Score"
+    colnames(pred_dat)[colnames(pred_dat)=="truth"] <- "Label"
+    m <- cv_model$modelCore[[1]]$model
+  } else {
+    stop(sprintf("build version [%s] is not supported yet!"))
+  }
+  
+  if(roc_plot)
+    model_perf_roc_plot(truth=pred_dat$Label, score=pred_dat$Score, cutoff=NULL, confusion_matrix=confusion_matrix_plot)
+  
+  # improtance 
+  if(feature_plot){
+    mat <- xgb.importance(model = m)
+    xgb.plot.importance(importance_matrix = mat, main="Feature Importance")
+  }
+  
+  # density 
+  if(density_plot){
+    model_score_density_plot(density_data=pred_dat, label=NULL, labs=T)
+  }
+  
+  # legend
+  legend_txt <- "Receiver operating characteristic (ROC) curve for distingush case and control in combined cross 
+  validation testing fold, the confidence interval (CI) of the sensitivity at the given specificity points is 
+  computed via the 95% CI are computed with 2000 stratified bootstrap replicates."
+  
+  if(fig_legend)
+    return(list(legend=legend_txt))
+  }
+```
+
+```{r version, include=TRUE}
+cat("Version:",params$version)
+## change log
+## 0.1.0 Grace Mo - init
+## 0.6.0 Grace Mo - updated model
+## 0.7.0 Grace Mo - remove feature Ethylene glycol
+## 0.8.0 Grace Mo - Add CEA 
+```
+
+**CONFIDENTIALITY**
+  
+**INFORMATION NOT RELEASABLE TO THE PUBLIC UNLESS AUTHORIZED BY LAW**: The information in the document has not been publicly disclosed and is privileged and confidential. It is for internal mProbe use only and must not be disseminated, distributed, or copied to persons not authorized to receive the information. Unauthorized disclosure may result in prosecution to the full extent of the law.
+  
+# Objective
+  
+## Case definition
+
+## Analysis misc. information
+
+```{r model_meta, echo=FALSE, include=TRUE}
+model_meta <- list()
+model_meta$name <- params$name
+model_meta$full_name <- params$full_name
+model_meta$platform <- params$platform
+model_meta$instrument <- params$instrument
+model_meta$version <- params$version
+model_meta$author <- eval(parse(text = params$author))
+model_meta$filename_prefix <- paste0(params$full_name,'_',params$version,".",gsub("\\.","",params$template_version),"_")
+knitr::kable(unlist(model_meta), col.names = c("value"))
+```
+
+# Cohort Summary
+
+```{r Cohort Summary, include=TRUE, warning=FALSE, message=FALSE}
+injodr_b1 <- readRDS("\\172.16.1.41\mProbe.dev\xzhu\mProbe\Projects\proj_20210401_CRC_MRD_analysis\SAM\dev\CRC_R\FIA_Metabolite\Plasma\Pos\merge_rds\1.merge_batch_inj_order.rds")
+injodr_b1$Batch <- "b1"
+
+sam_mom_pos <- readRDS("\\172.16.1.41\mProbe.dev\xzhu\mProbe\Projects\proj_20210401_CRC_MRD_analysis\SAM\dev\CRC_R\FIA_Metabolite\Plasma\Pos\merge_rds\9.merge_batch_sam_mom.rds")
+sam_mom_neg <- readRDS("\\172.16.1.41\mProbe.dev\xzhu\mProbe\Projects\proj_20210401_CRC_MRD_analysis\SAM\dev\CRC_R\FIA_Metabolite\Plasma\Neg\merge_rds\9.merge_batch_sam_mom.rds")
+
+sam_neg_b2 <- readRDS("\\172.16.1.52\mprobe.data_0\dev\CRC_R\FIA_Metabolite\Plasma\QE\20220215\_RESULT\20220216021530\002_TP2.2.MOM.QC.Rdata.Neg.rdata")
+sam_pos_b2 <- readRDS("\\172.16.1.52\mprobe.data_0\dev\CRC_R\FIA_Metabolite\Plasma\QE\20220215\_RESULT\20220216021530\002_TP2.2.MOM.QC.Rdata.Pos.rdata")
+injodr_b2 <- read_csv(r"(\\172.16.1.52\mprobe.data_0\dev\CRC_R\FIA_Metabolite\Plasma\QE\20220215\injection_order.csv)")
+
+sam_pos_b2 <- sam_mz_match(sam=sam_pos_b2, mz_target = as.numeric(rownames(sam_mom_pos)), mode="nearest", fill_missing=T, delta=5, unit="ppm")
+dataset_merge_pos <- list(injodr=rbind(injodr_b1,injodr_b2[,colnames(injodr_b1)]),
+                          cbind(sam_pos_b2,sam_mom_pos))
+
+sam_neg_b2 <- sam_mz_match(sam=sam_neg_b2, mz_target = as.numeric(rownames(sam_mom_neg)), mode="nearest", fill_missing=T, delta=5, unit="ppm")
+dataset_merge_neg <- list(injodr=rbind(injodr_b1,injodr_b2[,colnames(injodr_b1)]),
+                          cbind(sam_neg_b2,sam_mom_neg))
+
+dataset_list_pos <- list(b1=list(sam=sam_mom_pos,injodr=injodr_b1),
+                     b2=list(sam=sam_pos_b2,injodr=injodr_b2))
+console_out <- capture.output(dataset_merge_pos <- merge_dataset(dataset_list_pos, method="MzClust"))
+
+dataset_list_neg <- list(b1=list(sam=sam_mom_neg,injodr=injodr_b1),
+                     b2=list(sam=sam_neg_b2,injodr=injodr_b2))
+console_out <- capture.output(dataset_merge_neg <- merge_dataset(dataset_list_neg, method="MzClust"))
+
+
+
+anno_ms2_pos <- c("102.066595507453",
+"121.072212169731",
+"148.003882880289",
+"154.058609180249",
+"200.042399350119",
+"209.09202665001",
+"242.28418739901",
+"243.053009201651",
+"251.126235462802",
+"261.145438295908",
+'263.088336245919',
+"267.123611378799",
+"279.083824563458",
+"291.120185802913",
+
+# "63.0446637409358",
+"189.07382174469",
+"212.999443983435",
+"225.034461348789",
+"251.126235462802",
+"261.145438295908",
+"277.141178966041",
+"314.232384243285",
+# "448.306423993434",
+"591.313176329417")
+
+anno_ms2_neg <- c("104.035222716427",
+"145.061676743472",
+"172.991161746067",
+"178.050781285519",
+"204.066392869353",
+"212.002092441821",
+"239.092206046883",
+"295.227598307113",
+"311.222567559519",
+"319.226848506325",
+"448.306423993434",
+
+"187.006842352532",
+"187.072740566537",
+"189.003144645891",
+"199.006906000978",
+"199.037032520897",
+"203.001971482397",
+"267.123611378799",
+"383.153141624837")
+
+
+
+anno_ms2_name_pos <- c("Urea[1]",
+"Urea[2]",
+"Taurine",
+"Creatine",
+"7-methyl-3-nitroimidazo[1,2-a]pyridine",
+"L-Kynurenine",
+"Bis(2-ethylhexyl) amine",
+"DL-Tryptophan",
+"5-[(1E)-3-hydroxy-3-methylbut-1-en-1-yl]-2-methylcyclohex-5-ene-1,2,4-triol[1]",
+"N1-phenethylbenzene-1-carbothioamide",
+"Asp-Glu",
+"NP-005519",
+"3-(5,7-dimethoxy-4-oxo-4H-chromen-2-yl)propanoic acid",
+"5-[(1E)-3-hydroxy-3-methylbut-1-en-1-yl]-2-methylcyclohex-5-ene-1,2,4-triol[2]",
+
+
+# "Ethylene glycol",
+"N-((4-AMINO-2-METHYL-5-PYRIMIDINYL)METHYL)FORMAMIDE",
+"Oxalosuccinic acid[1]",
+"Cysteinylcysteine",
+"5-Methylcytosine",
+"L-gamma-Glutamyl-L-leucine",
+"Methyl (3aR,5Z,9E,11aS)-10-methyl-3-methylene-2-oxo-2,3,3a,4,7,8,11,11a-octahydrocyclodeca[b]furan-6-carboxylate",
+"9-Decenoylcarnitine",
+# "Glycocholic acid",
+"UROBILIN, (-)-"
+)
+
+anno_ms2_name_neg <- c("L-Serine",
+"D-(-)-Glutamine",
+"4-Phenolsulfonic acid",
+"Hippuric acid",
+"Indole-3-lactic acid",
+"3-Indoxyl sulphate",
+"CMPF",
+"NP-020521",
+"(±)9-HpODE",
+"(+/-)11(12)-EET",
+"Glycochenodeoxycholic acid",
+
+"p-Cresylsulfate",
+"Glycyl-4-hydroxyproline",
+"Oxalosuccinic acid[2]",
+"4-vinylphenol sulfate",
+"α-L-Fucopyranose",
+"guaiacol sulfate",
+"2-(2-Carboxyethyl)-4-methyl-5-pentyl-3-furoic acid",
+"16Î±-Hydroxydehydroepiandrosterone 3-sulfate"
+)
+
+anno_map <- data.frame(mz=c(anno_ms2_pos,anno_ms2_neg),anno=c(anno_ms2_name_pos,anno_ms2_name_neg),mode=c(rep("Pos",length(anno_ms2_pos)),rep("Neg",length(anno_ms2_neg))))
+
+
+
+m <- readRDS("D:/mProbe.model/ymo/mprobe-model-ms/R/MRD/MS2/2022.01.04/Fia-Metabolite-Plasma-MRD-MS2_0.5.0.120_008_cv_model_feature.rds")
+feature_select <- setdiff(m$modelCore[[1]]$miningSchema$name[m$modelCore[[1]]$miningSchema$importance > 0],
+                          lapply(c("267.123611", "251.126235", "277.14117", "261.145438", "242.284187", "295.227598", "291.120185", "279.083824", "200.042399"), function(x){
+                            m$modelCore[[1]]$miningSchema$name[grepl(x,m$modelCore[[1]]$miningSchema$name)]
+                          }) %>% Reduce(f = c))
+anno_map <- anno_map[anno_map$mz %in% feature_select,]
+
+
+
+
+
+
+sam_pos <- sam_mz_match(sam=dataset_merge_pos$sam, mz_target = as.numeric(anno_map$mz[anno_map$mode %in% "Pos"]), mode="nearest", fill_missing=F, delta=5, unit="ppm")
+sam_neg <- sam_mz_match(sam=dataset_merge_neg$sam, mz_target = as.numeric(anno_map$mz[anno_map$mode %in% "Neg"]), mode="nearest", fill_missing=F, delta=5, unit="ppm")
+
+
+
+anno_pos <- metabolite_annotation(data.frame(mz=as.numeric(rownames(sam_pos))), method = "ExactMatch", database = "KEGG", delta=5, unit="ppm", queryadductlist=c("M+H","M+2H","M+K","M+Na","M+NH4","M+2Na-H","2M+Na","2M+K"), mode="pos")
+anno_neg <- metabolite_annotation(data.frame(mz=as.numeric(rownames(sam_neg))), method = "ExactMatch", database = "KEGG", delta=5, unit="ppm", queryadductlist=c("M-H","M+Cl","M+CH3COO","M-2H"), mode="neg")
+
+dataset_merge <- list()
+dataset_merge$sam <- rbind(sam_pos,sam_neg)
+dataset_merge$injodr <- dataset_merge_pos$injodr
+dataset_merge$anno$mzMap <- rbind(anno_pos$mzMap,anno_neg$mzMap)
+dataset_merge$anno$pathMap <- rbind(anno_pos$pathMap,anno_neg$pathMap)
+
+
+###### Meta data
+
+new_data <- as.data.frame(read_excel("//172.16.1.31/mProbe.model/yjin/mprobe-model-ms/ColonCancer/20220221/Recurrence cohort clinical information 20220218刘博反馈_copy.xlsx",sheet = 1,col_names=T))
+colnames(new_data)[11] <- "Study#"
+new_data <-  new_data[!is.na(new_data$`Study#`),]
+
+new_data[new_data$"Study#" %in% "R165","PCT"] <- 1
+
+sample_collect <- as.data.frame(read_excel("//172.16.1.31/mProbe.model/yjin/mprobe-model-ms/ColonCancer/20220221/华大收血样本单-2020.08.24至今 zr.xlsx",sheet = 4))
+sample_collect <- sample_collect[,c("编号","日期")]
+sample_collect <- na.omit(sample_collect)
+sample_collect$"Study#" <- gsub("-.*","",sample_collect$"编号")
+
+data.table::setnames(new_data, 
+                     old = c("样本源编号","NEW复发时间","性别","年龄","手术时间","体重","身高","吸烟","复发时间"),
+                     new = c("Sample.Source.ID","Rec_Date","Gender", "Age", "Surgery_date", "Weight", "Height", "Smoke","Recurrence_date"))
+new_data <- new_data[,c( "Sample.Source.ID","Rec_Date","Study#","pT","pN","pM","pTNM","cT","cN","cM","cTNM","Age","Gender","Surgery_date","Weight","Height", "Smoke" ,"ACT","PCT","CA125","CA153","CA19-9","CEA","AFP","Ki－67","MMR","MSI","MLH1","MSH2","PMS2","MSH6","CDX2","HER2","CK7","CK20","Braf","T","N","M")]
+
+new_data$recur_Days <- as.numeric(difftime(new_data$Rec_Date ,new_data$Surgery_date, units = c("days")))
+new_data$Recurrence <- as.factor(ifelse(!is.na(new_data$recur_Days),1,0))
+
+sample_collect <- merge(sample_collect,new_data,by="Study#",all.x=T)
+
+sample_collect_new <- read_excel(r"(D:\mProbe.model\ymo\mprobe-model-ms\R\MRD\sample_collect_20220225 James checked-new.xlsx)")
+
+sample_collect$"日期" <- sample_collect$Surgery_date <- NULL
+sample_collect <- merge(sample_collect,sample_collect_new[,c("编号","日期","手术时间")])
+
+sample_collect$Surgery_date <- as.Date(sample_collect$"手术时间")
+sample_collect$"日期" <-  as.Date(sample_collect$"日期")
+sample_collect$Collect_Number <- gsub("\\..*","",gsub("^(.*-)","",sample_collect$"编号"))
+sample_collect$Collect_Number <- ifelse(grepl("R",sample_collect$Collect_Number)==T,"0",sample_collect$Collect_Number)
+sample_collect$Collection_Days <-  difftime(sample_collect$"日期",sample_collect$Surgery_date, units = c("days"))
+
+colnames(sample_collect)[colnames(sample_collect) %in% c("编号","Study#")] <- c("ID","Patient.ID")
+
+
+CEA_result1 <- read_excel(r"(\\172.16.1.52\mprobe.data_0\dev\CRC_R\Lab\Plasma\311_411\20220303_2\CRC_testing_result.xlsx)")
+CEA_result2 <- read_excel(r"(\\172.16.1.52\mprobe.data_0\dev\CRC_R\Lab\Plasma\311_411\20220301_1\CRC_testing_result.xlsx)",sheet=6,skip = 1)
+CEA_result1 <- CEA_result1[,3:4]; colnames(CEA_result1) <- c("ID","CEA"); CEA_result1$Batch <- "7f2e7020-8ef9-11ec-9c62-00155d01c91a"
+CEA_result2 <- CEA_result2[,c(2,3)]; colnames(CEA_result2) <- c("ID","CEA"); CEA_result2$Batch <- "b1"
+CEA_result <- rbind(CEA_result1,CEA_result2)
+CEA_result <- CEA_result[!duplicated(CEA_result$ID),]
+
+# 
+sample_collect$CEA <- NULL
+
+dataset_merge$injodr$ID <- NA
+dataset_merge$injodr$ID[which(dataset_merge$injodr$Sample.Type %in% "Case" & !grepl("QC",dataset_merge$injodr$File.Name))] <- gsub(".*Sample_|\\..*","",dataset_merge$injodr$File.Name[which(dataset_merge$injodr$Sample.Type %in% "Case"& !grepl("QC",dataset_merge$injodr$File.Name))])
+dataset_merge$injodr$ID <- gsub("_","-",dataset_merge$injodr$ID)
+
+dataset_merge$injodr <- merge(dataset_merge$injodr,sample_collect,all.x=T)
+dataset_merge$injodr <- merge(dataset_merge$injodr,CEA_result,all.x=T)
+
+
+last_collection_day <- sapply(unique(dataset_merge$injodr$Sample.Source.ID[!is.na(dataset_merge$injodr$ID)]), function(x){
+  tmp <- dataset_merge$injodr[dataset_merge$injodr$Sample.Source.ID %in% x,]
+  max(tmp$Collection_Days,na.rm=T)
+})
+dataset_merge$injodr <- merge(dataset_merge$injodr,data.frame(last_collection_day),by.x="Sample.Source.ID",by.y=0,all.x=T)
+
+dataset_merge$injodr$PFS <- (as.numeric(dataset_merge$injodr$recur_Days) - as.numeric(dataset_merge$injodr$Collection_Days))
+dataset_merge$injodr$PFS[which(is.na(dataset_merge$injodr$PFS) & is.na(dataset_merge$injodr$recur_Days))] <- (as.numeric(dataset_merge$injodr$last_collection_day) - as.numeric(dataset_merge$injodr$Collection_Days))[which(is.na(dataset_merge$injodr$PFS) & is.na(dataset_merge$injodr$recur_Days))]
+dataset_merge$injodr$Sample.Type <- ifelse(dataset_merge$injodr$Recurrence == 1,"Case","Control")
+
+
+dataset_merge$injodr <- dataset_merge$injodr[!is.na(dataset_merge$injodr$Collection_Days),]
+
+
+dataset_merge$sam <- t(attach_meta_to_sam(t(dataset_merge$sam),dataset_merge$injodr,attcols = "CEA",by = "File.Name"))
+
+
+dataset_train <- dataset_merge
+dataset_test <- NULL
+
+dataset_merge <- readRDS("////172.16.1.31//mProbe.model//ymo//mprobe-model-ms//R//MRD//MS2//20221130//Fia-Metabolite-Plasma-MRD-MS2_0.8.0.140_000_dataset_merge.rds")
+# CRC MRD relapse classification criteria:
+# 
+# Case:
+# Relapse patient: pre-op sample + relapse sample (last sample collection time > 14 days, and relapse time-last sample collection time < 180 or 360 days)
+# Non-relapse patient: pre-op sample
+# 
+# Control:
+# Relapse patient: 1st post-op sample and post-op sample collection time – surgery time < 14 days
+# Non-relapse patient: all post-op samples
+
+## TODO change def of case ctrl
+
+# dataset_train$injodr$Sample.Type <- NA
+# dataset_train$injodr$Sample.Type <- ifelse(((dataset_train$injodr$Collection_Days > 0 & dataset_train$injodr$Collection_Days < 14) | (is.na(dataset_train$injodr$recur_Days) & dataset_train$injodr$Collection_Days > 0)) %in% TRUE,"Control",NA)
+# 
+# dataset_train$injodr$Sample.Type <- ifelse(((dataset_train$injodr$Collection_Days <= 0) |
+#                                                                                                                 (dataset_train$injodr$Collection_Days > 14 & (dataset_train$injodr$recur_Days - dataset_train$injodr$Collection_Days) < 360)) %in% TRUE,"Case",dataset_train$injodr$Sample.Type)
+
+dataset_train$injodr$Sample.Type <- NA
+dataset_train$injodr$Sample.Type <- ifelse(((dataset_train$injodr$Collection_Days > 0 & dataset_train$injodr$Collection_Days < 21) | (is.na(dataset_train$injodr$recur_Days) & dataset_train$injodr$Collection_Days > 0)) %in% TRUE,"Control",NA)
+
+dataset_train$injodr$Sample.Type <- ifelse(((dataset_train$injodr$Collection_Days <= 0) |
+                                                                                                                (dataset_train$injodr$Collection_Days > 21 & (dataset_train$injodr$recur_Days - dataset_train$injodr$Collection_Days) < 90)) %in% TRUE,"Case",dataset_train$injodr$Sample.Type)
+
+# dataset_train$injodr$Sample.Type[which(dataset_train$injodr$Patient.ID %in% "R142-0" )] <- "Case"
+# table(dataset_train$injodr$Sample.Type)
+
+response_idx <- 0
+result_set <- new.env()
+
+
+demo_data_train <- new_data[,c("recur_Days","pT","pN","pM","pTNM","cT","cN","cM","cTNM","Age","Gender","Weight","Height", "Smoke" ,"ACT","PCT","CA125","CA153","CA19-9","CEA","AFP","Ki－67","MLH1","MSH2","PMS2","MSH6","CDX2","HER2","CK7","CK20","Braf","T","N","M")]
+demo_data_train$Treatment <- paste(demo_data_train$ACT,demo_data_train$PCT,sep="|")
+
+demo_data_train$Sample.Type <- ifelse(is.na(demo_data_train$recur_Days),"Control","Case")
+demo_data_rec <- column_datatype_recognition(data = data.frame(demo_data_train), char_factor_th = 10, num_factor_th = 10, char_to_num_th = 0.2, outlier_convert = T, char_remove = F,na_column_remove = T,na_to_char = NULL)
+demo_data_rec$Gender <- as.factor(demo_data_rec$Gender)
+demo_stat_train <- epiDisplay::tableStack(vars=2:(ncol(demo_data_rec)-1), demo_data_rec, by=Sample.Type)
+markdown_dt_table(dt_data = tableStack_convert(demo_stat_train), caption = "Discovery Cohort Patient Characteristic", 
+                  auto_format = F, show_rownames = F, filter = F, sort = F)
+
+demo_data_rec$Sample.Type <- "all"
+
+demo_stat_train <- epiDisplay::tableStack(vars=2:(ncol(demo_data_rec)), demo_data_rec, by=Sample.Type)
+demo_stat_train <- as.data.frame.matrix(demo_stat_train)
+demo_stat_train$Feature <- rownames(demo_stat_train)
+markdown_dt_table(dt_data = demo_stat_train, caption = "Discovery Cohort Patient Characteristic", 
+                  auto_format = F, show_rownames = F, filter = F, sort = F)
+
+```
+
+# Study design
+
+```{r study_design, fig.height=4, message=FALSE, warning=FALSE}
+
+study_design_diagram(dataset_train = dataset_train, dataset_test = dataset_test, exclude_criteria_txt=NULL)
+cat(document_figure_legend(legend =  "This figure illustrates overview of the case–control study designs.", fig_idx = fi<-fi+1))
+
+```
+
+# Data preprocessing
+
+## Raw data handling
+
+`r document_preprocess_rawdata()`
+
+## Signal correction
+
+`r document_preprocess_peakextract()`
+
+```{r peakextract, message=FALSE, warning=FALSE, include=TRUE, fig.height=6, fig.width=6}
+
+batcor_img <- png::readPNG(RCurl::getURLContent("http://172.16.1.71:20001/analysis/assets/1.0.0/img/batchCor.png"))
+
+plot(0:1,0:1,type="n",ann=FALSE,axes=FALSE)
+rasterImage(batcor_img,0,0,1,1)
+cat(document_figure_legend(legend = "Peak intensity before and after loess correction", fig_idx = fi<-fi+1))
+
+```
+
+## Normalization
+
+`r document_preprocess_normalization(method = "median")`
+
+```{r normalization,  message=FALSE, warning=FALSE, include=TRUE, fig.height=9, fig.width=8}
+
+norm_img <- png::readPNG(RCurl::getURLContent("http://172.16.1.71:20001/analysis/assets/1.0.0/img/norm.png"))
+
+plot(0:1,0:1,type="n",ann=FALSE,axes=FALSE)
+rasterImage(norm_img,0,0,1,1)
+cat(document_figure_legend(legend = "Box plots and kernel density plots before and after normalization. The boxplots show at most 50 features 
+due to space limit. The density plots are based on all samples.", fig_idx = fi<-fi+1))
+
+```
+
+# Discovery
+
+`r document_statistics_summary()`
+
+## Univariate analysis
+
+`r document_statistics_univariate()`
+
+### Global feature univariate analysis
+
+```{r global_univar, include=TRUE, warning=FALSE, fig.height = 8, fig.width = 9}
+
+global_metric <- c("fold","utest","auc","nar")
+
+# TODO - use dataset_train_raw if feature engineer is applied
+uni_stat <- univar_pipeline_binary(sam=dataset_train$sam, injodr=dataset_train$injodr, response_index=response_idx, type=global_metric)
+
+uni_stat_obj <- statTable_convert(stat_tab = uni_stat, metric = global_metric, top = 0.2)
+
+f_obj <- univar_summary_plot(uni_stat=uni_stat_obj$stat_post, fig_legend=T)
+cat(document_figure_legend(legend = f_obj$legend, fig_idx = fi<-fi+1))
+
+
+uni_stat <- data.frame(Feature=rownames(uni_stat), uni_stat)
+uni_stat$mode <- ifelse(uni_stat$Feature %in% rownames(dataset_merge_pos$sam),"Pos","Neg")
+
+write.csv(uni_stat, file=paste0(model_meta$filename_prefix,"004_feature_univariate_global.csv"), row.names=T)
+
+# Save to result_set
+result_set$feature_univariate_global <- uni_stat
+
+```
+
+
+### Global feature selection
+
+```{r feature_select_param}
+
+uni_stat_obj$metric[["-log10(pval)"]]$defaultPost <- -log10(0.05)
+uni_stat_obj$metric[["-log10(pval)"]]$defaultPre <- 0.05
+uni_stat_obj$metric[["log2(fold)"]]$defaultPost <- log2(c(1/1.1,1.1))
+uni_stat_obj$metric[["log2(fold)"]]$defaultPre <- c(1/1.1,1.1)
+uni_stat_obj$metric[["auc"]]$defaultPost <- uni_stat_obj$metric[["auc"]]$defaultPre <- 0.6
+# uni_stat_obj$metric[["nar"]]$defaultPost <- uni_stat_obj$metric[["nar"]]$defaultPre <- 0.4
+
+# Save to result_set
+result_set$feature_select_metric <- uni_stat_obj$metric
+
+```
+
+
+```{r feature_select, fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+
+# feature select
+stat_feature_select <- uni_stat
+
+write.csv(stat_feature_select, file=paste0(model_meta$filename_prefix,"005_marker_univariate_global.csv"), row.names=T)
+
+stat_feature_select$Detail <- sprintf('<a class="btn btn-default btn-xs" title="Feature Detail" target="_blank" href="%s"><span class="glyphicon glyphicon-stats"></span></a>', paste0(model_meta$filename_prefix,"003_feature_analytics_tool.html?f=", rownames(stat_feature_select)))
+
+# feature annotation
+## TODO - use dataset_train_raw if feature engineer is applied
+anno_string <- anno_format(anno= dataset_train$anno, anno_type="kegg", anno_by="mz.raw", feature_list=feature_select, output="string_agg", agg_sep = "<br>")
+stat_feature_select <- cbind(Annotation=unname(anno_string[rownames(stat_feature_select)]), stat_feature_select)
+
+markdown_dt_table(stat_feature_select , caption ="Feature Selection", numeric_round=4, filter = T)
+
+# source('//172.16.1.41/mProbe.dev/ymo/OmicsDP_pkg/R/function_visualization_diagram.R', echo=F)
+# 
+# feature_selection_summary_plot(stat = uni_stat_obj$stat,metric_list = uni_stat_obj$metric,filter_summary=NULL)
+
+
+tmp <- uni_stat
+tmp <- merge(anno_map,tmp,by.x="mz",by.y="Feature")
+rownames(tmp) <- make.unique(tmp$anno)
+
+
+
+# volcano plot of raw feature
+f_obj <- feature_volcano_plot(stat=tmp[,c("fold","pval")], feature_select=rownames(tmp), show_label = T, title = NULL, fold.up.th = uni_stat_obj$metric[["log2(fold)"]]$defaultPre[2], fold.down.th = uni_stat_obj$metric[["log2(fold)"]]$defaultPre[1], fig_legend = T)
+f_obj$g+
+  ylim(0,15)+
+  xlim(-1.2,1.2)
+cat(document_figure_legend(legend = f_obj$legend, fig_idx = fi<-fi+1))
+
+
+
+f_obj <- feature_volcano_plot(stat=tmp[,c("fold","pval")], feature_select=rownames(tmp)[nchar(rownames(tmp)) < 30], show_label = T, title = NULL, fold.up.th = uni_stat_obj$metric[["log2(fold)"]]$defaultPre[2], fold.down.th = uni_stat_obj$metric[["log2(fold)"]]$defaultPre[1], fig_legend = T)
+f_obj$g+
+  ylim(0,15)+
+  xlim(-1.2,1.2)
+
+
+
+# Save to result_set
+result_set$feature_selection <- stat_feature_select
+
+```
+
+
+
+
+## Multivariate analysis
+
+### PCA analysis
+
+`r document_statistics_multivariate_pca()`
+
+```{r pca, eval=FALSE, fig.height=5, fig.width=6, message=FALSE, warning=FALSE, include=FALSE, webgl=TRUE}
+
+# TODO - use dataset_train_raw if feature engineer is applied
+dataset_merge <- readRDS("//172.16.1.31/mProbe.model/ymo/mprobe-model-ms/R/MRD/FIA-Metabolite-Plasma/20221227/Fia-Metabolite-Plasma-MRD_0.6.0.100_000_dataset_merge.rds")
+th <- 0.3
+na_ratio_train <- apply(dataset_merge$sam[,colnames(dataset_merge$sam) %in% dataset_merge$injodr$File.Name], 1, function(x) mean(is.na(x)))
+sam_tmp <- dataset_merge$sam[which(na_ratio_train<th),colnames(dataset_merge$sam) %in% dataset_merge$injodr$File.Name]
+
+injodr_pca <- dataset_merge$injodr[,c("Sample.Source.ID","ID","File.Name","Sample.Type","Patient.ID","Rec_Date","recur_Days","Recurrence","日期",
+"Surgery_date","Collect_Number","Collection_Days","last_collection_day","PFS")]
+injodr_pca$time.to.surgery <- as.numeric(difftime(injodr_pca$Surgery_date,injodr_pca$日期,units = c("days")))
+injodr_pca$surgery.to.recur <- as.numeric(difftime(injodr_pca$Surgery_date,injodr_pca$Rec_Date,units = c("days")))
+injodr_pca$time.to.recur <- as.numeric(difftime(injodr_pca$日期,injodr_pca$Rec_Date,units = c("days")))
+injodr_pca$time.to.recur <- ifelse(!is.na(injodr_pca$time.to.recur),injodr_pca$time.to.recur,-10000)
+
+uni_stat.1 <- univar_pipeline_continuous(sam=sam_tmp, injodr=injodr_pca, response_index=which(colnames(injodr_pca)=="surgery.to.recur"), type= c("absr"))
+uni_stat.1$feature <- rownames(uni_stat.1)
+uni_stat.2 <- univar_pipeline_continuous(sam=sam_tmp, injodr=injodr_pca, response_index=which(colnames(injodr_pca)=="time.to.recur"), type= c("absr"))
+uni_stat.2$feature <- rownames(uni_stat.2)
+
+fff.1 <- uni_stat.1$feature[uni_stat.1$absr>=0.2]
+fff.2 <- uni_stat.2$feature[uni_stat.2$absr>=0.2]
+fff <- unique(intersect(fff.1,fff.2))
+
+injodr_pca$After.Surgery <- ifelse(injodr_pca$time.to.surgery<0,"After.Surgery",ifelse(injodr_pca$time.to.surgery> 0,"Before.Surgery","Around.Surgery"))
+injodr_pca.1 <- injodr_pca[which(injodr_pca$After.Surgery!="Around.Surgery"),]
+injodr_pca.1$Collect_Number <- as.numeric(injodr_pca.1$Collect_Number)
+
+first.after.surgery <- injodr_pca.1[which(injodr_pca.1$After.Surgery=="After.Surgery"),] %>% group_by(Patient.ID)%>% dplyr::slice(which.min(Collect_Number)) %>% as.data.frame()
+nearest.recur <- injodr_pca.1[which(injodr_pca.1$Recurrence==1&injodr_pca.1$After.Surgery=="After.Surgery"),] %>% group_by(Patient.ID)%>% dplyr::slice(which.max(time.to.recur)) %>% as.data.frame()
+before.surgery <- injodr_pca.1[which(injodr_pca.1$After.Surgery=="Before.Surgery"),] %>% group_by(Patient.ID)%>% dplyr::slice(which.max(Collect_Number)) %>% as.data.frame()
+
+injodr_pca.1$recur.group <- ifelse(injodr_pca.1$File.Name %in% nearest.recur$File.Name, "Closest.point.to.recurrence",
+                                ifelse(injodr_pca.1$File.Name %in% first.after.surgery$File.Name,"1st.point.after.surgery", 
+                                       ifelse(injodr_pca.1$File.Name%in% before.surgery$File.Name,  "Points.before.surgery",
+                                              "Points.after.surgery")))
+
+data_pca <- multivar_pipeline_pca(sam=sam_tmp[rownames(sam_tmp) %in% fff,], 
+                                  injodr=injodr_pca.1[!is.na(injodr_pca.1$recur.group.2),], response_idx=which(colnames(injodr_pca.1)=="recur.group.2"),
+                                  sampletype=unique(injodr_pca.1$recur.group.2),Frule = 0.7, imputeM = 'KNN', center=T, scale.=T)
+pca.plot <- attach_meta_to_sam(sam=data_pca$x,injodr = injodr_pca.1,attcols = c("Patient.ID","recur.group","After.Surgery","recur.group.2"))
+
+ ggplot(data = pca.plot, aes(x = PC1, y = PC2, color = recur.group.2)) +
+      geom_point(alpha = 0.8, size = 1,aes(shape=recur.group.2)) + theme_bw() +
+      stat_ellipse(geom = "polygon", aes(fill = recur.group.2), alpha = 0.25, show.legend = T, level = 0.9,size=0.9) +
+      scale_x_continuous(limits = c(-18,15),breaks = seq(-15,25,5))+
+      scale_y_continuous(limits = c(-18,29),breaks = seq(-20,30,10)) +
+      ggprism::theme_prism(base_size = 13) +
+      labs(title="PCA",
+           x = paste(sprintf("PC 1 (%1.1f", data_pca$sdev[1]^2/sum((data_pca$sdev)^2) *  100), "%)"),
+           y = paste(sprintf("PC 2 (%1.1f", data_pca$sdev[2]^2/sum((data_pca$sdev)^2) *  100), "%)")) +
+      theme(panel.border = element_rect(colour = "black", fill=NA),
+           # legend.title = element_text(size=rel(0.8),color = "black"),
+           legend.background = element_rect(fill="white", size=0.2, linetype="solid", colour ="black"),
+           legend.position = c(0.99, 0.99),
+           legend.justification = c("right", "top"))
+ggsave(file="PCA.20240514.svg", plot=p, width=6, height=5)
+#####################################
+#20240514 new maximum separation group
+#####################################
+injodr_pca.1$recur.group.2 <- ifelse(injodr_pca.1$File.Name %in% nearest.recur$File.Name, "MRD.point",
+                                ifelse(injodr_pca.1$File.Name %in% first.after.surgery$File.Name,"1st.point.after.surgery",NA))
+
+data_pca.2 <- multivar_pipeline_pca(sam=sam_tmp[rownames(sam_tmp) %in% fff.1,], 
+                                  injodr=injodr_pca.1,response_idx=which(colnames(injodr_pca.1)=="recur.group.2"), sampletype=unique(injodr_pca.1$recur.group.2), Frule = 0.7, imputeM = 'KNN', center=T, scale.=T)
+pca.plot <- attach_meta_to_sam(sam=data_pca.2$x,injodr = injodr_pca.1,attcols = c("Patient.ID","recur.group","After.Surgery","recur.group.2"))
+
+p <- ggplot(data = pca.plot[pca.plot$recur.group.2 %in% c("MRD.point","1st.point.after.surgery"),], aes(x = PC1, y = PC2, color = recur.group.2)) +
+      geom_point(alpha = 0.8, size = 1,aes(shape=recur.group.2)) + theme_bw() +
+      stat_ellipse(geom = "polygon", aes(fill = recur.group.2), alpha = 0.25, show.legend = T, level = 0.9,size=0.9) +
+      scale_color_manual(values=c("#68BD66","#DC4C51","#68BD66","#DC4C51","#377EB8","#FDA25C")) +
+      scale_fill_manual(values=c("#68BD66","#DC4C51","#68BD66","#DC4C51","#377EB8","#FDA25C")) +
+      scale_x_continuous(limits = c(-18,15),breaks = seq(-15,25,5))+
+      scale_y_continuous(limits = c(-18,29),breaks = seq(-20,30,10)) +
+      ggprism::theme_prism(base_size = 13) +
+      labs(title="PCA",
+           x = paste(sprintf("PC 1 (%1.1f", data_pca.2$sdev[1]^2/sum((data_pca$sdev)^2) *  100), "%)"),
+           y = paste(sprintf("PC 2 (%1.1f", data_pca.2$sdev[2]^2/sum((data_pca$sdev)^2) *  100), "%)")) +
+      theme(panel.border = element_rect(colour = "black", fill=NA),
+           # legend.title = element_text(size=rel(0.8),color = "black"),
+           legend.background = element_rect(fill="white", size=0.2, linetype="solid", colour ="black"),
+           legend.position = c(0.4, 0.99),
+           legend.justification = c("right", "top"))
+ggsave(file="PCA.20240514.2.svg", plot=p, width=6, height=5)
+```
+
+### PLS-DA analysis
+
+```{r pls, eval=FALSE, fig.height=5, fig.width=6, message=FALSE, warning=FALSE, include=FALSE}
+source('//172.16.1.41/mProbe.dev/ymo/OmicsDP_pkg/R/function_visualization_opls.R', echo=F)
+
+oplsda <- multivar_pipeline_opls(sam =sam_tmp[rownames(sam_tmp) %in% fff.1,],#
+                                 injodr = injodr_pca.1[!is.na(injodr_pca.1$recur.group.2),],response_idx=which(colnames(injodr_pca.1)=="recur.group.2"),
+                                 sampletype = unique(injodr_pca.1$recur.group.2),
+                                 Frule = 0.7,imputeM = "KNN", predI = 3, orthoI = 0)
+
+pca.plot <- attach_meta_to_sam(sam=oplsda@scoreMN,injodr = injodr_pca.1,attcols = c("Patient.ID","recur.group.2"))   
+# pca.plot$recur.group <- factor(pca.plot$recur.group,levels = c("1st.point.after.surgery","Points.before.surgery","Points.after.surgery","Closest.point.to.recurrence"))
+ggplot(data = pca.plot[pca.plot$recur.group.2!="Points.before.surgery",], aes(x = p2, y = p1, color = recur.group.2)) +
+      geom_point(alpha = 0.8, size = 1,aes(shape=recur.group.2)) + theme_bw() +
+      stat_ellipse(geom = "polygon", aes(fill = recur.group.2), alpha = 0.25, show.legend = T, level = 0.9,size=0.9) +
+      # scale_x_continuous(limits = c(-10,25),breaks = seq(-10,25,10))+
+      # scale_y_continuous(limits = c(-10,15),breaks = seq(-10,15,5)) +
+      ggprism::theme_prism(base_size = 13) +
+      labs(title="Scores (PLS-DA)",
+           x = paste(sprintf("Component 1 (%1.1f", oplsda@modelDF$R2X[1] *  100), "%)"), 
+           y = paste(sprintf("Component 2 (%1.1f", oplsda@modelDF$R2X[2] *  100), "%)")) +
+      theme(panel.border = element_rect(colour = "black", fill=NA),
+           # legend.title = element_text(size=rel(0.8),color = "black"),
+           legend.background = element_rect(fill="white", size=0.2, linetype="solid", colour ="black"),
+           legend.position = c(0.461, 0.01),
+           legend.justification = c("right", "bottom"))
+
+ggsave(file="PLS-DA.20240514.svg", plot=p, width=6, height=5)
+save.image("PCA.data.image_20240514.rdata")
+#####################################
+#20240514 new maximum separation group
+#####################################
+injodr_pca.1$recur.group.2 <- ifelse(injodr_pca.1$File.Name %in% nearest.recur$File.Name, "MRD.point",
+                                ifelse(injodr_pca.1$File.Name %in% first.after.surgery$File.Name,"1st.point.after.surgery", 
+                                       ifelse(injodr_pca.1$File.Name%in% before.surgery$File.Name,  "Points.before.surgery",NA)))
+
+oplsda <- multivar_pipeline_opls(sam =sam_tmp[rownames(sam_tmp) %in% fff.1,],
+                          injodr = injodr_pca.1[!is.na(injodr_pca.1$recur.group.2),],response_idx=which(colnames(injodr_pca.1)=="recur.group.2"),
+                                 sampletype = unique(injodr_pca.1$recur.group.2),
+                                 Frule = 0.7,imputeM = "KNN", predI = 3, orthoI = 0)
+
+pca.plot <- attach_meta_to_sam(sam=oplsda@scoreMN,injodr = injodr_pca.1,attcols = c("Patient.ID","recur.group.2"))   
+p<-ggplot(data = pca.plot[pca.plot$recur.group.2!="Points.before.surgery",], aes(x = p2, y = p1, color = recur.group.2)) +
+      geom_point(alpha = 0.8, size = 1.2,aes(shape=recur.group.2)) + theme_bw() +
+      stat_ellipse(geom = "polygon", aes(fill = recur.group.2), alpha = 0.25, show.legend = T, level = 0.9,size=1) +
+      scale_x_continuous(limits = c(-10,17),breaks = seq(-10,25,5))+
+      scale_y_continuous(limits = c(-14,13),breaks = seq(-10,15,5)) +
+      scale_color_manual(values=c("#68BD66","#DC4C51","#68BD66","#DC4C51","#377EB8","#FDA25C")) +   
+      scale_fill_manual(values=c("#68BD66","#DC4C51","#68BD66","#DC4C51","#377EB8","#FDA25C")) +   
+      ggprism::theme_prism(base_size = 13) +
+      labs(title="Scores (PLS-DA)",
+           x = paste(sprintf("Component 1 (%1.1f", oplsda@modelDF$R2X[1] *  100), "%)"), 
+           y = paste(sprintf("Component 2 (%1.1f", oplsda@modelDF$R2X[2] *  100), "%)")) +
+      theme(panel.border = element_rect(colour = "black", fill=NA),
+           legend.background = element_rect(fill="white", size=0.2, linetype="solid", colour ="black"),
+           legend.position = c(0.99, 0.01),
+           legend.justification = c("right", "bottom"))
+
+ggsave(file="PLS-DA.20240514.2.svg", plot=p, width=6, height=5)
+
+```
+
+### Heatmap analysis
+
+`r document_statistics_multivariate_heatmap()`
+
+```{r heatmap, eval=FALSE, fig.height=6, fig.width=8, message=FALSE, warning=FALSE, include=FALSE}
+# TODO - use dataset_train_raw if feature engineer is applied
+f_obj <- sam_heatmap_plot2(sam=dataset_train$sam, injodr=dataset_train$injodr[which(dataset_train$injodr$Sample.Type %in% c("Case","Control")),], selected_feature = NULL, top=NULL, title=NULL, scale. = "row", fig_legend=T, width = 8, height = 10, fontsize = 8)
+cat(document_figure_legend(legend = f_obj$legend, fig_idx = fi<-fi+1)) 
+
+f_obj <- sam_heatmap_plot2(sam=dataset_train$sam, injodr=dataset_train$injodr[which(dataset_train$injodr$Sample.Type %in% c("Case","Control")),], selected_feature = NULL, top=NULL, title=NULL, scale. = "row", fig_legend=T, width = 8, height = 10, fontsize = 8,column_split = T)
+cat(document_figure_legend(legend = f_obj$legend, fig_idx = fi<-fi+1)) 
+
+```
+
+# Feature-level 
+
+## Feature level cross validation
+
+```{r perf_list, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+
+perf_list <- list()
+for(i in 501:1000){
+  set.seed(i)
+  
+  param<-list(rf_ntree_low=2, rf_ntree_up=5,nrandom_search=20,xgb_nrounds_low=2,xgb_nrounds_up=20, xgb_max_depth_low=2,xgb_max_depth_up=20, elastic_alpha_low=0.1,  elastic_alpha_up=1,  kfold=3,  normalization = F,  fillna = F)
+  a <- capture.output(cv_model_feature <- cv_train_mlr(sam=dataset_train$sam, feature_train=NULL, injodr=dataset_train$injodr, response_idx=response_idx, method="xgboost", objective="Classification", param=param, build = "2.0.1"))
+  
+  
+  result_score <- cv_model_feature$modelCore[[1]]$data$prediction$data
+
+  result_score1 <- cv_model_feature$modelCore[[1]]$modelApply(t(dataset_merge$sam[,!(colnames(dataset_merge$sam) %in% rownames(cv_model_feature$modelCore[[1]]$data$prediction$data))]))
+  result_score <- rbind(result_score[,c("predictedValue"),drop=F],result_score1[,c("predictedValue"),drop=F])
+
+  result_score <- merge(dataset_merge$injodr,result_score,by.x="File.Name",by.y=0)
+  
+result_score$qualitativeRisk <- ifelse(result_score$predictedValue >= cv_model_feature$modelCore[[1]]$data$prediction$cutoff,"high","low")
+  
+  a <- perf_table(result_score)
+  a$seed_num <- i
+  a$method <- "method_1"
+  
+  b <- perf_table1(result_score,cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff)
+  b$seed_num <- i; b$method <- "method_2"
+
+  c <- perf_table2(result_score,cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff)
+  c$seed_num <- i; c$method <- "method_3"
+  
+  
+  perf_list[[length(perf_list)+1]] <- rbind(a,b,c)
+}
+
+
+perf <- Reduce(rbind,perf_list)
+
+write.csv(perf,paste0(model_meta$filename_prefix,"performance_and_501-1000.csv"))
+
+
+```
+
+
+
+```{r cpd_training, fig.align="center", fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+
+
+
+param<-list(rf_ntree_low=2, rf_ntree_up=5,nrandom_search=20,xgb_nrounds_low=2,xgb_nrounds_up=20, xgb_max_depth_low=2,xgb_max_depth_up=20, elastic_alpha_low=0.1,  elastic_alpha_up=1,  kfold=3,  normalization = F,  fillna = F)
+
+set.seed(808)
+# cv_model_feature <- readRDS(paste0(model_meta$filename_prefix,"008_cv_model_feature.rds"))
+a <- capture.output(cv_model_feature <- cv_train_mlr(sam=dataset_train$sam, feature_train=NULL, injodr=dataset_train$injodr, response_idx=response_idx, method="xgboost", objective="Classification", param=param, build = "2.0.1"))
+saveRDS(cv_model_feature,paste0(model_meta$filename_prefix,"008_cv_model_feature.rds"))
+
+# a <- capture.output(cv_model_feature <- cv_train_mlr(sam=dataset_train$sam, feature_train=NULL, injodr=dataset_train$injodr, response_idx=response_idx, method="ElasticNet", objective="Classification", param=param, build = "2.0.1"))
+
+
+# param<-list(rf_ntree_low=2, rf_ntree_up=20,nrandom_search=20,xgb_nrounds_low=2,xgb_nrounds_up=20, xgb_max_depth_low=2,xgb_max_depth_up=20, elastic_alpha_low=0.1,  elastic_alpha_up=1,  kfold=3,  normalization = F,  fillna = T)
+# a <- capture.output(cv_model_feature <- cv_train_mlr(sam=dataset_train$sam, feature_train=NULL, injodr=dataset_train$injodr, response_idx=response_idx, method="randomForest", objective="Classification", param=param, build = "2.0.1"))
+
+f_obj <- cv_perf_plot_binary(cv_model = cv_model_feature, build="2.0.1", feature_plot=F, confusion_matrix_plot=F, fig_legend = T)
+cat(document_figure_legend(legend = f_obj$legend, fig_idx = fi<-fi+1))
+
+# Save to result_set
+result_set$feature_model <- cv_model_feature
+
+```
+
+### Model Performance
+
+```{r model_performance, message=FALSE, warning=FALSE, include=TRUE}
+
+# confusion matrix of training
+cm_train <- data.frame("Postive"=c(cv_model_feature$modelCore[[1]]$explanation$classification$tp,
+                                   cv_model_feature$modelCore[[1]]$explanation$classification$fn),
+                       "Negative"=c(cv_model_feature$modelCore[[1]]$explanation$classification$fp,
+                                    cv_model_feature$modelCore[[1]]$explanation$classification$tn))
+cm_train$Total <- rowSums(cm_train)
+cm_train["Total",]<- colSums(cm_train)
+rownames(cm_train)<- c("Test postive","Test negative","Total")
+
+markdown_dt_table(dt_data=cm_train,caption="Training Confusion Matrix",sort=F,filter=F)
+
+# Training Performance Cologard table
+pred_result <- cv_model_feature$modelCore[[1]]$data$prediction$data
+colnames(pred_result)[colnames(pred_result)=="predictedValue"] <- "Score"
+pred_result_train <- model_perf_table(pred_result = pred_result, class_idx=which(colnames(pred_result)=="truth"))
+markdown_dt_table(dt_data = pred_result_train, caption = "Training Performance", sort = F, filter=F, show_rownames = F, auto_format = F)
+
+# Training Performance 510k
+pred_result_train_510k <- model_perf_table_510k(truth = cv_model_feature$modelCore[[1]]$data$prediction$data$truth, 
+                                           score = cv_model_feature$modelCore[[1]]$data$prediction$data$predictedValue) 
+markdown_dt_table(dt_data = pred_result_train_510k, caption = "Training Performance 510k", sort = F, filter=F)
+
+# Model Performance
+markdown_dt_table(dt_data = as.data.frame(cv_model_feature$modelCore[[1]]$explanation$classification)[,-(1:2)], caption = "Model Performance", show_rownames = F, filter=F, numeric_round = 3, sort = F)
+
+```
+
+### Feature importance
+
+```{r feature_importance, message=FALSE, warning=FALSE, include=TRUE}
+
+# feature_model <- cv_model_feature$modelCore[[1]]$miningSchema$name[cv_model_feature$modelCore[[1]]$miningSchema$importance>0]
+
+feature_model <- cv_model_feature$modelCore[[1]]$miningSchema[cv_model_feature$modelCore[[1]]$miningSchema$importance>0,]
+feature_model <- merge(anno_map,feature_model,by.x="mz",by.y="name")
+
+a <- merge(feature_model,uni_stat,by.x="mz",by.y=0)
+markdown_dt_table(a)
+
+markdown_dt_table(feature_model[,c("mz","anno","importance","lowValue","highValue")],caption ="Feature Importance", filter=T, sort_by=3, sort_dir="desc", show_rownames=T, auto_format=T, numeric_round=4, color_bar= 3)
+
+```
+
+
+## Marker distribution in model features
+
+```{r marker_dist_model_feature, message=FALSE, warning=FALSE, include=TRUE, fig.height = 9, fig.width = 14}
+
+
+sam_feature_new <- lapply(feature_model$mz, function(x){
+  
+  sam=dataset_train$sam
+  injodr=dataset_train$injodr[which(dataset_train$injodr$Sample.Type %in% c("Case","Control")),]
+  
+  injodr <- (injodr[,c("ID","Recurrence","File.Name","recur_Days","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID")])
+  
+  dat <- attach_meta_to_sam(sam = t(sam[x,,drop=F]), injodr = injodr, attcols = c("Recurrence","File.Name","recur_Days","Sample.Type","Collection_Days","Sample.ID","ID","Sample.Source.ID"))
+  roc_dat <- proc_data_convert(truth=dat$Sample.Type, score=dat[, which(colnames(dat)==x)])
+  rocobj <- pROC::roc(cases=roc_dat$cases, controls=roc_dat$controls)
+  
+  ret <- c("threshold", "sensitivity", "specificity","ppv", "npv","tn","tp","fp","fn")
+  threshold <- pROC::coords(rocobj, "best", transpose=T, ret=ret)
+  
+  cutoff <- as.numeric(threshold[1])
+  
+  
+  
+  injodr <- dataset_train$injodr[dataset_train$injodr$Collection_Days > 0,]
+  
+  rem_id <- lapply(unique(injodr$Sample.Source.ID), function(x){
+    tmp <- injodr[injodr$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  injodr <- injodr[!(injodr$Sample.Source.ID %in% rem_id),]
+  
+  dat <- attach_meta_to_sam(sam = t(sam[x,,drop=F]), injodr = injodr, attcols = c("Recurrence","File.Name","recur_Days","Sample.Type","Collection_Days","Sample.ID","ID","Sample.Source.ID"))
+  
+  dat <- dat[order(dat$ID),]
+  tmp <- lapply(unique(dat$Sample.Source.ID), function(i){
+    tmp <- dat[dat$Sample.Source.ID %in% i,]
+    if(nrow(tmp[tmp$Collection_Days > 14,])>2){
+      pred_score <- mean(last(tmp[tmp$Collection_Days > 14,colnames(tmp) %in% x],n = 2))
+      # pred_score <- last(tmp$predictedValue,n = 2)[1]
+    } else{
+      pred_score <- last(tmp[,colnames(tmp) %in% x])
+    }
+    qualitativeRisk <- ifelse(pred_score > cutoff,1,
+                              ifelse(pred_score <= cutoff,0,NA))
+    
+    data.frame(Sample.Source.ID=i,
+               pred_score=pred_score,
+               # qualitativeRisk=qualitativeRisk,
+               truth=unique(as.character(tmp$Recurrence)))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+  colnames(tmp)[which(colnames(tmp) %in% c("pred_score"))] <- x
+  # rownames(tmp) <- tmp$Sample.Source.ID
+  return(tmp)
+
+}) %>% Reduce(f=function(x, y){merge(x, y, all=T)})
+
+rownames(sam_feature_new) <- sam_feature_new$Sample.Source.ID
+injodr <- sam_feature_new[,1:2]
+injodr$Sample.Type <- injodr$truth
+injodr$File.Name <- injodr$Sample.Source.ID
+sam_feature_new$Sample.Source.ID <- sam_feature_new$truth <- NULL
+
+colnames(sam_feature_new) <- anno_map$anno[match(colnames(sam_feature_new),anno_map$mz)]
+
+
+f_obj <- feature_roc_plot(sam=t(sam_feature_new),injodr=injodr, response_idx = response_idx, cohort_idx = NULL, feature_select=colnames(sam_feature_new), ncol=7, nrow=4, fig_legend=T)
+f_obj$g
+cat(document_figure_legend(legend = f_obj$legend, fig_idx = fi<-fi+1))
+
+
+
+
+
+result_score <- cv_model_feature$modelCore[[1]]$data$prediction$data
+
+result_score1 <- cv_model_feature$modelCore[[1]]$modelApply(t(dataset_merge$sam[,!(colnames(dataset_merge$sam) %in% rownames(cv_model_feature$modelCore[[1]]$data$prediction$data))]))
+result_score <- rbind(result_score[,c("predictedValue"),drop=F],result_score1[,c("predictedValue"),drop=F])
+
+result_score <- merge(dataset_merge$injodr,result_score,by.x="File.Name",by.y=0)
+result_score$qualitativeRisk <- ifelse(result_score$predictedValue >= cv_model_feature$modelCore[[1]]$data$prediction$cutoff & result_score$CEA >=5,"high","low")
+
+
+result_score <- (result_score[result_score$Collection_Days > 0,c("predictedValue","Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID")])
+
+rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+  tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+  if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+    return(x)
+}) %>% Reduce(f=c)
+result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+model_pred_score <- lapply(unique(result_score$Sample.Source.ID), function(x){
+  tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+  if(nrow(tmp[tmp$Collection_Days > 14,])>2){
+    pred_score <- mean(last(tmp$predictedValue[tmp$Collection_Days > 14],n = 2))
+  } else {
+    pred_score <- last(tmp$predictedValue)
+  }
+  qualitativeRisk <- ifelse(pred_score > cv_model_feature$modelCore[[1]]$data$prediction$cutoff,1,0)
+  
+  data.frame(Sample.Source.ID=x,
+             pred_score=pred_score,
+             # qualitativeRisk=qualitativeRisk,
+             truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+}) %>% Reduce(f=rbind)
+model_pred_score$truth <- ifelse(model_pred_score$truth==1,"Case","Control")
+
+
+
+uni_stat_c <- univar_pipeline_binary(sam = t(sam_feature_new),injodr = injodr,response_index = 0,type = c("utest","fold","auc"))
+select_feature_c <- rownames(uni_stat_c)[order(uni_stat_c$auc,decreasing = T)][1:5]
+
+
+markdown_dt_table(uni_stat_c)
+```
+
+```{r multi_roc, fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+roc_dat <- proc_data_convert(truth=model_pred_score$truth, score=model_pred_score$pred_score)
+rocobj <- pROC::roc(cases=roc_dat$cases, controls=roc_dat$controls)
+
+
+pROC::plot.roc(rocobj, print.auc = F)
+sam_feature_new <- sam_feature_new[,select_feature_c]
+
+sapply(1:ncol(sam_feature_new),function(i){
+  roc_dat <- proc_data_convert(truth=injodr$Sample.Type, score=sam_feature_new[,i])
+  rocobj <- pROC::roc(cases=roc_dat$cases, controls=roc_dat$controls)
+  pROC::lines.roc(rocobj,col=(i+1))
+})
+
+label <- paste(c(colnames(sam_feature_new)),"AUC:",lapply(colnames(sam_feature_new), function(x){ round(uni_stat_c[x,"auc"],3) }) %>% Reduce(f=c))
+
+label <- c("Model Score AUC: 0.747",label)
+
+
+legend(x = 0.76, y = 0.35,
+       # "bottomright",
+       bty = "n",
+       legend=label,
+       col=1:(ncol(sam_feature_new)+1),
+       lwd=4, cex =0.6, xpd = TRUE, horiz = F)
+
+
+pROC::plot.roc(rocobj, print.auc = F)
+sam_feature_new <- sam_feature_new[,select_feature_c]
+
+sapply(1:ncol(sam_feature_new),function(i){
+  roc_dat <- proc_data_convert(truth=injodr$Sample.Type, score=sam_feature_new[,i])
+  rocobj <- pROC::roc(cases=roc_dat$cases, controls=roc_dat$controls)
+  pROC::lines.roc(rocobj,col=(i+1))
+})
+
+
+
+```
+
+## Performance Table
+
+
+```{r perf, fig.align="center", fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+result_score <- cv_model_feature$modelCore[[1]]$data$prediction$data
+
+result_score1 <- cv_model_feature$modelCore[[1]]$modelApply(t(dataset_merge$sam[,!(colnames(dataset_merge$sam) %in% rownames(cv_model_feature$modelCore[[1]]$data$prediction$data))]))
+result_score <- rbind(result_score[,c("predictedValue"),drop=F],result_score1[,c("predictedValue"),drop=F])
+
+result_score <- merge(dataset_merge$injodr,result_score,by.x="File.Name",by.y=0)
+result_score$qualitativeRisk <- ifelse(result_score$predictedValue >= cv_model_feature$modelCore[[1]]$data$prediction$cutoff & result_score$CEA >=5,"high","low")
+
+perf_table <- function(result_score){
+  result_score <- (result_score[result_score$Collection_Days > 0,c("Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID")])
+  
+  
+  rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+  
+  medianLeadTime <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(tmp$Recurrence %in% 1 & sum(tmp$qualitativeRisk %in% "high")>0){
+      return(tmp$recur_Days[1]- min(as.numeric(tmp$Collection_Days)[tmp$qualitativeRisk %in% "high"],na.rm = T))
+    } else {
+      return(NA)
+    }
+  }) %>% Reduce(f=c)
+  
+  medianLeadTime <- medianLeadTime[which(medianLeadTime > 14)]
+  
+  tmp <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    data.frame(Sample.Source.ID=x,
+               qualitativeRisk=ifelse(sum(result_score$qualitativeRisk[result_score$Sample.Source.ID %in% x] %in% "high")>0,1,0),
+               truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+  
+
+  total <- length(tmp$Sample.Source.ID)
+  pos <- length(tmp$Sample.Source.ID[tmp$truth %in% "Case"])
+  neg <- length(tmp$Sample.Source.ID[tmp$truth %in% "Control"])
+  tp <- length(tmp$Sample.Source.ID[tmp$truth %in% "Case" & tmp$qualitativeRisk %in% 1])
+  fn <- pos - tp
+  tn <- length(tmp$Sample.Source.ID[tmp$truth %in% "Control" & tmp$qualitativeRisk %in% 0])
+  fp <- neg - tn
+  
+  pref1 <- data.frame(TotalPatient=total,
+                      relapse=pos,
+                      detected_precent=tp/ pos,
+                      Specificity = tn/(tn + fp),
+                      ppv=tp / (tp + fp),
+                      npv=tn / (tn + fn),
+                      medianLeadTime=median(medianLeadTime,na.rm = T))
+  
+  return(pref1)
+}
+
+
+perf <- rbind(perf_table(result_score[result_score$ACT %in% 0 & result_score$PCT %in% 0,]),
+      perf_table(result_score[result_score$ACT %in% 1 & result_score$PCT %in% 0,]),
+      perf_table(result_score[result_score$ACT %in% 0 & result_score$PCT %in% 1,]),
+      perf_table(result_score[result_score$ACT %in% 1 & result_score$PCT %in% 1,]),
+      perf_table(result_score))
+
+rownames(perf) <- c("ACT -/PCT -","ACT + /PCT -","ACT - / PCT +","ACT + / PCT +","Total")
+markdown_dt_table(perf,caption = "Model performance")
+
+
+roc_plot <- function(result_score){
+  result_score <- (result_score[result_score$Collection_Days > 0,c("Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID")])
+  
+  
+  rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+  tmp <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    data.frame(Sample.Source.ID=x,
+               qualitativeRisk=ifelse(sum(result_score$qualitativeRisk[result_score$Sample.Source.ID %in% x] %in% "high")>0,1,0),
+               truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+  
+  # pref1 <- as.data.frame(t(model_perf_table_510k(truth = tmp$truth,
+                                 # score = tmp$qualitativeRisk) ))
+  model_perf_roc_plot(truth = tmp$truth,score = tmp$qualitativeRisk,confusion_matrix = F)
+}
+roc_plot(result_score)
+
+
+
+result_score_CEA <- result_score
+result_score_CEA$qualitativeRisk <- ifelse(result_score_CEA$CEA < 5,"low","high")
+
+perf_CEA <- rbind(perf_table(result_score_CEA[result_score_CEA$ACT %in% 0 & result_score_CEA$PCT %in% 0,]),
+      perf_table(result_score_CEA[result_score_CEA$ACT %in% 1 & result_score_CEA$PCT %in% 0,]),
+      perf_table(result_score_CEA[result_score_CEA$ACT %in% 0 & result_score_CEA$PCT %in% 1,]),
+      perf_table(result_score_CEA[result_score_CEA$ACT %in% 1 & result_score_CEA$PCT %in% 1,]),
+      perf_table(result_score_CEA))
+
+rownames(perf_CEA) <- c("ACT -/PCT -","ACT + /PCT -","ACT - / PCT +","ACT + / PCT +","Total")
+markdown_dt_table(perf_CEA,caption = "CEA performance")
+
+```
+
+
+```{r perf2,fig.align="center", fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+
+perf_table1 <- function(result_score,cutoff){
+  result_score <- (result_score[result_score$Collection_Days > 0,c("Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID","predictedValue")])
+  
+  rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+  
+  medianLeadTime <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(tmp$Recurrence %in% 1 & sum(tmp$qualitativeRisk %in% "high")>0){
+      return(tmp$recur_Days[1]- min(as.numeric(tmp$Collection_Days)[tmp$qualitativeRisk %in% "high"],na.rm = T))
+    } else {
+      return(NA)
+    }
+  }) %>% Reduce(f=c)
+  
+  medianLeadTime <- medianLeadTime[which(medianLeadTime > 14)]
+  
+  tmp <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp[tmp$Collection_Days > 14,])>2){
+      pred_score <- mean(last(tmp$predictedValue[tmp$Collection_Days > 14],n = 2))
+      # pred_score <- last(tmp$predictedValue,n = 2)[1]
+    } else{
+      pred_score <- last(tmp$predictedValue)
+    }
+    qualitativeRisk <- ifelse(pred_score > cutoff,1,0)
+    
+    data.frame(Sample.Source.ID=x,
+               qualitativeRisk=qualitativeRisk,
+               truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+   # model_perf_roc_plot(truth = tmp$truth,score = tmp$qualitativeRisk,confusion_matrix = F)
+  
+  total <- length(tmp$Sample.Source.ID)
+  pos <- length(tmp$Sample.Source.ID[tmp$truth %in% "Case"])
+  neg <- length(tmp$Sample.Source.ID[tmp$truth %in% "Control"])
+  tp <- length(tmp$Sample.Source.ID[tmp$truth %in% "Case" & tmp$qualitativeRisk %in% 1])
+  fn <- pos - tp
+  tn <- length(tmp$Sample.Source.ID[tmp$truth %in% "Control" & tmp$qualitativeRisk %in% 0])
+  fp <- neg - tn
+  
+  pref1 <- data.frame(TotalPatient=total,
+                      relapse=pos,
+                      detected_precent=tp/ pos,
+                      Specificity = tn/(tn + fp),
+                      ppv=tp / (tp + fp),
+                      npv=tn / (tn + fn),
+                      medianLeadTime=median(medianLeadTime,na.rm = T))
+  
+  return(pref1)
+}
+roc_plot1 <- function(result_score,cutoff){
+  result_score <- (result_score[result_score$Collection_Days > 0,c("predictedValue","Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID")])
+  
+  rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+  tmp <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp[tmp$Collection_Days > 14,])>2){
+      pred_score <- mean(last(tmp$predictedValue[tmp$Collection_Days > 14],n = 2))
+      # pred_score <- last(tmp$predictedValue,n = 2)[1]
+    } else{
+      pred_score <- last(tmp$predictedValue)
+    }
+    qualitativeRisk <- ifelse(pred_score > cutoff,1,0)
+    
+    data.frame(Sample.Source.ID=x,
+               qualitativeRisk=qualitativeRisk,
+               truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+  model_perf_roc_plot(truth = tmp$truth,score = tmp$qualitativeRisk,confusion_matrix = F)
+}
+
+roc_plot1(result_score,cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff)
+perf <- rbind(perf_table1(result_score[result_score$ACT %in% 0 & result_score$PCT %in% 0,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table1(result_score[result_score$ACT %in% 1 & result_score$PCT %in% 0,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table1(result_score[result_score$ACT %in% 0 & result_score$PCT %in% 1,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table1(result_score[result_score$ACT %in% 1 & result_score$PCT %in% 1,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table1(result_score,cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff))
+
+rownames(perf) <- c("ACT -/PCT -","ACT + /PCT -","ACT - / PCT +","ACT + / PCT +","Total")
+markdown_dt_table(perf,caption = "Model performance- method 2")
+
+
+
+result_score_CEA <- result_score
+result_score_CEA$qualitativeRisk <- ifelse(result_score_CEA$CEA < 5,"low","high")
+result_score_CEA$predictedValue <- result_score_CEA$CEA
+
+perf_CEA <- rbind(perf_table1(result_score_CEA[result_score_CEA$ACT %in% 0 & result_score_CEA$PCT %in% 0,],cutoff=5),
+      perf_table1(result_score_CEA[result_score_CEA$ACT %in% 1 & result_score_CEA$PCT %in% 0,],cutoff=5),
+      perf_table1(result_score_CEA[result_score_CEA$ACT %in% 0 & result_score_CEA$PCT %in% 1,],cutoff=5),
+      perf_table1(result_score_CEA[result_score_CEA$ACT %in% 1 & result_score_CEA$PCT %in% 1,],cutoff=5),
+      perf_table1(result_score_CEA,cutoff=5))
+
+rownames(perf_CEA) <- c("ACT -/PCT -","ACT + /PCT -","ACT - / PCT +","ACT + / PCT +","Total")
+markdown_dt_table(perf_CEA,caption = "CEA performance- method 2")
+
+
+```
+
+
+```{r perf3,fig.align="center", fig.height=4, fig.width=4, message=FALSE, warning=FALSE}
+
+
+perf_table2 <- function(result_score,cutoff){
+  result_score <- (result_score[result_score$Collection_Days > 0,c("Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID","predictedValue")])
+  
+  
+  rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+  
+  medianLeadTime <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(tmp$Recurrence %in% 1 & sum(tmp$qualitativeRisk %in% "high")>0){
+      return(tmp$recur_Days[1]- min(as.numeric(tmp$Collection_Days)[tmp$qualitativeRisk %in% "high"],na.rm = T))
+    } else {
+      return(NA)
+    }
+  }) %>% Reduce(f=c)
+  
+  medianLeadTime <- medianLeadTime[which(medianLeadTime > 14)]
+  
+  tmp <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp[tmp$Collection_Days > 14,])>2){
+      # pred_score <- mean(last(tmp$predictedValue[tmp$Collection_Days > 14],n = 2))
+      pred_score <- last(tmp$predictedValue,n = 2)[1]
+    } else{
+      pred_score <- last(tmp$predictedValue)
+    }
+    qualitativeRisk <- ifelse(pred_score > cutoff,1,0)
+    
+    data.frame(Sample.Source.ID=x,
+               qualitativeRisk=qualitativeRisk,
+               truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+  
+  
+  total <- length(tmp$Sample.Source.ID)
+  pos <- length(tmp$Sample.Source.ID[tmp$truth %in% "Case"])
+  neg <- length(tmp$Sample.Source.ID[tmp$truth %in% "Control"])
+  tp <- length(tmp$Sample.Source.ID[tmp$truth %in% "Case" & tmp$qualitativeRisk %in% 1])
+  fn <- pos - tp
+  tn <- length(tmp$Sample.Source.ID[tmp$truth %in% "Control" & tmp$qualitativeRisk %in% 0])
+  fp <- neg - tn
+  
+  pref1 <- data.frame(TotalPatient=total,
+                      relapse=pos,
+                      detected_precent=tp/ pos,
+                      Specificity = tn/(tn + fp),
+                      ppv=tp / (tp + fp),
+                      npv=tn / (tn + fn),
+                      medianLeadTime=median(medianLeadTime,na.rm = T))
+  
+  return(pref1)
+}
+
+roc_plot2 <- function(result_score,cutoff){
+  result_score <- (result_score[result_score$Collection_Days > 0,c("predictedValue","Recurrence","recur_Days","qualitativeRisk","Sample.Type","Collection_Days","Sample.ID","Sample.Source.ID")])
+  
+  rem_id <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp)==1 & tmp$Collection_Days < 14)
+      return(x)
+  }) %>% Reduce(f=c)
+  result_score <- result_score[!(result_score$Sample.Source.ID %in% rem_id),]
+  
+  tmp <- lapply(unique(result_score$Sample.Source.ID), function(x){
+    tmp <- result_score[result_score$Sample.Source.ID %in% x,]
+    if(nrow(tmp[tmp$Collection_Days > 14,])>2){
+      # pred_score <- mean(last(tmp$predictedValue[tmp$Collection_Days > 14],n = 2))
+      pred_score <- last(tmp$predictedValue,n = 2)[1]
+    } else{
+      pred_score <- last(tmp$predictedValue)
+    }
+    qualitativeRisk <- ifelse(pred_score > cutoff,1,0)
+    
+    data.frame(Sample.Source.ID=x,
+               qualitativeRisk=qualitativeRisk,
+               truth=unique(result_score$Recurrence[result_score$Sample.Source.ID %in% x]))
+  }) %>% Reduce(f=rbind)
+  tmp$truth <- ifelse(tmp$truth==1,"Case","Control")
+  model_perf_roc_plot(truth = tmp$truth,score = tmp$qualitativeRisk,confusion_matrix = F)
+}
+
+roc_plot2(result_score,cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff)
+
+perf <- rbind(perf_table2(result_score[result_score$ACT %in% 0 & result_score$PCT %in% 0,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table2(result_score[result_score$ACT %in% 1 & result_score$PCT %in% 0,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table2(result_score[result_score$ACT %in% 0 & result_score$PCT %in% 1,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table2(result_score[result_score$ACT %in% 1 & result_score$PCT %in% 1,],cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff),
+              perf_table2(result_score,cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff))
+
+rownames(perf) <- c("ACT -/PCT -","ACT + /PCT -","ACT - / PCT +","ACT + / PCT +","Total")
+markdown_dt_table(perf,caption = "Model performance- method 3")
+
+
+
+result_score_CEA <- result_score
+result_score_CEA$qualitativeRisk <- ifelse(result_score_CEA$CEA < 5,"low","high")
+result_score_CEA$predictedValue <- result_score_CEA$CEA
+
+perf_CEA <- rbind(perf_table2(result_score_CEA[result_score_CEA$ACT %in% 0 & result_score_CEA$PCT %in% 0,],cutoff=5),
+      perf_table2(result_score_CEA[result_score_CEA$ACT %in% 1 & result_score_CEA$PCT %in% 0,],cutoff=5),
+      perf_table2(result_score_CEA[result_score_CEA$ACT %in% 0 & result_score_CEA$PCT %in% 1,],cutoff=5),
+      perf_table2(result_score_CEA[result_score_CEA$ACT %in% 1 & result_score_CEA$PCT %in% 1,],cutoff=5),
+      perf_table2(result_score_CEA,cutoff=5))
+
+rownames(perf_CEA) <- c("ACT -/PCT -","ACT + /PCT -","ACT - / PCT +","ACT + / PCT +","Total")
+markdown_dt_table(perf_CEA,caption = "CEA performance- method 3")
+
+
+```
+
+### CEA table
+
+
+```{r cea_count, fig.align="center", message=FALSE, warning=FALSE}
+
+markdown_dt_table(dt_data = 
+t(data.frame(rec=c(Num=sum(!is.na(result_score$recur_Days)),
+           predH=sum(!is.na(result_score$recur_Days) & result_score$qualitativeRisk %in% "high"),
+           predL=sum(!is.na(result_score$recur_Days) & result_score$qualitativeRisk %in% "low"),
+           ceaH=sum(!is.na(result_score$recur_Days) & result_score$CEA >= 5,na.rm = T)),
+           Non_rec=
+           c(Num=sum(is.na(result_score$recur_Days)),
+           predH=sum(is.na(result_score$recur_Days) & result_score$qualitativeRisk %in% "high"),
+           predL=sum(is.na(result_score$recur_Days) & result_score$qualitativeRisk %in% "low"),
+           ceaH=sum(is.na(result_score$recur_Days) & result_score$CEA>=5,na.rm = T))))
+)
+```
+
+
+### MRD
+
+```{r mrd1, fig.align="center", fig.height=3, fig.width=4, message=FALSE, warning=FALSE}
+
+result_score_rec <- result_score[!is.na(result_score$recur_Days),]
+result_score_ctrl <- result_score[is.na(result_score$recur_Days),]
+
+result_score_rec_tmp <- result_score_rec[,c("Sample.Source.ID","Sample.ID","Collection_Days","predictedValue", "Rec_Date" ,"Surgery_date","qualitativeRisk","ACT","PCT")]
+result_score_rec_tmp$Collection_Days <- as.numeric(result_score_rec_tmp$Collection_Days)
+
+result_score_rec_tmp <- result_score_rec_tmp[result_score_rec_tmp$qualitativeRisk %in% "high" & result_score_rec_tmp$Collection_Days > 0,]
+result_score_rec_tmp$Rec_time <- (as.Date(result_score_rec_tmp$"Rec_Date")-as.Date(result_score_rec_tmp$"Surgery_date"))
+result_score_rec_tmp$Model_Time <- result_score_rec_tmp$Collection_Days
+
+a <- lapply(unique(result_score_rec_tmp$Sample.Source.ID), function(x){
+  result <- result_score_rec_tmp[result_score_rec_tmp$Sample.Source.ID %in% x,]
+  result$Sample.ID[which.min(result$predictedValue)]
+})
+result_score_rec_tmp <- result_score_rec_tmp[result_score_rec_tmp$Sample.ID %in% a,]
+result_score_rec_tmp <- result_score_rec_tmp[result_score_rec_tmp$Collection_Days <= result_score_rec_tmp$Rec_time & 
+                                               result_score_rec_tmp$Collection_Days > 21, ]
+result_score_rec_tmp <- result_score_rec_tmp[order(result_score_rec_tmp$Sample.Source.ID,result_score_rec_tmp$Model_Time),]
+result_score_rec_tmp <- result_score_rec_tmp[!(duplicated(result_score_rec_tmp$Sample.Source.ID)),]
+
+
+plot_data1 <- result_score_rec_tmp[,c("Sample.Source.ID", "Sample.ID","Model_Time")];colnames(plot_data1)[3] <- "days"
+plot_data1$Group <- "Model relapse"
+plot_data2 <- result_score_rec_tmp[,c("Sample.Source.ID", "Sample.ID","Rec_time")];colnames(plot_data2)[3] <- "days"
+plot_data2$Group <- "Clinical relapse"
+
+plot_data <- rbind(plot_data1,plot_data2)
+plot_data$Group <- factor(plot_data$Group,levels = c("Model relapse","Clinical relapse"))
+
+
+plot_data$days <- as.numeric(plot_data$days)
+ggplot2::ggplot() +
+  geom_line(data = plot_data,aes(x =Group, y = days,group=Sample.ID))+
+  ggplot2::geom_point(data = plot_data, aes(x = Group, y = days,color = Group), size = 2,shape =15) +
+  # ggplot2::scale_x_discrete(limits = c("AC", "BC")) +
+  # ggplot2::scale_color_discrete(name = NULL,
+  #                               labels = c("BC","AC")) +
+  scale_color_manual(values = c("#00007B", "#FA7D01"))+
+  ggplot2::labs(x = "",y = "Days") +
+  # ggplot2::theme_bw() +
+  ggplot2::theme(panel.grid.major.x = ggplot2::element_blank(),
+                 # legend.background = ggplot2::element_rect(color = "black"),
+                 legend.position = "none",#c(0.9, 0.9),
+                 panel.border = ggplot2::element_blank(),
+                 panel.background = element_blank(),
+                 axis.line = ggplot2::element_line(color = 'black'),
+                 # plot.margin = ggplot2::margin(t = 4, l = 4, b = 4, r = 32),
+                 plot.title = element_text(size=10,color = "black",face = "bold"),
+                 axis.text.x = element_text(size = 10,color = "black",face = "bold"),
+                 axis.text.y = element_text(size = 10,color = "black",face = "bold"),
+                 axis.title.x = element_text(size = 10,face = "bold"),
+                 axis.title.y = element_text(size = 10,face = "bold")
+                 )
+
+plot_data$Group2 <- ifelse(plot_data$Sample.ID %in% result_score_rec_tmp$Sample.ID[result_score_rec_tmp$ACT %in% 0 & result_score_rec_tmp$PCT %in% 0],"ACT - / PCT -",
+                           ifelse(plot_data$Sample.ID %in% result_score_rec_tmp$Sample.ID[result_score_rec_tmp$ACT %in% 1 & result_score_rec_tmp$PCT %in% 0],"ACT + / PCT -",
+                                  ifelse(plot_data$Sample.ID %in% result_score_rec_tmp$Sample.ID[result_score_rec_tmp$ACT %in% 0 & result_score_rec_tmp$PCT %in% 1],"ACT - / PCT +",
+                                         ifelse(plot_data$Sample.ID %in% result_score_rec_tmp$Sample.ID[result_score_rec_tmp$ACT %in% 1 & result_score_rec_tmp$PCT %in% 1],"ACT + / PCT +",NA))))
+
+
+plot_data$days <- as.numeric(plot_data$days)
+
+ggplot2::ggplot() +
+  geom_line(data = plot_data,aes(x =Group, y = days,group=Sample.ID,color = Group2))+
+  ggplot2::geom_point(data = plot_data, aes(x = Group, y = days,color = Group2), size = 2,shape =15) +
+  # ggplot2::scale_x_discrete(limits = c("AC", "BC")) +
+  # ggplot2::scale_color_discrete(name = NULL,
+  #                               labels = c("BC","AC")) +
+  scale_color_manual(values = c("#00007B", "#FA7D01","#057900"))+###FA7D01 #00007B #057900
+  ggplot2::labs(x = "",y = "Days") +
+  # ggplot2::theme_bw() +
+  ggplot2::theme(panel.grid.major.x = ggplot2::element_blank(),
+                 # legend.background = ggplot2::element_rect(color = "black"),
+                 legend.key = element_rect(fill = "white"),
+                 legend.position = "top", 
+                 panel.background = element_blank(),
+                 panel.border = ggplot2::element_blank(),
+                 axis.line = ggplot2::element_line(color = 'black'),
+                 legend.title =ggplot2::element_blank(),
+                 plot.margin = ggplot2::margin(t = 4, l = 4, b = 4, r = 32),
+                 plot.title = element_text(size=10,color = "black",face = "bold"),
+                 axis.text.x = element_text(size = 10,color = "black",face = "bold"),
+                 axis.text.y = element_text(size = 10,color = "black",face = "bold"),
+                 axis.title.x = element_text(size = 10,face = "bold"),
+                 axis.title.y = element_text(size = 10,face = "bold")
+  )
+
+```
+
+## Survival Curve
+
+### 1st sample positive and negative group
+
+```{r survival1,  message=FALSE, warning=FALSE, include=T,fig.width=5,fig.height=4}
+
+survival_curve_plot <- function(survival_data,col=c("red","black"),xlab="Time",ylab="Survival probability",title="",...){
+  
+  ts <- check_required_column(req_cols = c("Time"),input_cols = colnames(survival_data))
+  
+  if(sum(colnames(survival_data)=="Status")==0)
+    survival_data$Status <- T
+  
+  if(sum(colnames(survival_data)=="Group")==0)
+    survival_data$Group <- "All"
+  
+  prob <- lapply(1:nrow(survival_data),function(i){
+    x <- survival_data[i,,drop=F]
+    
+    tmp <- survival_data[survival_data$Group %in% survival_data$Group[survival_data$Time %in% x],]
+    surv_group <- survival_data[survival_data$Group %in% x$Group,]
+    
+    if(as.integer(x$Status) == 1){
+      count <- sum(surv_group$Time[as.integer(surv_group$Status) == 1] < x$Time)
+      prob <- 1 - count/nrow(surv_group)
+    }else{
+      tmp1 <- surv_group[surv_group$Time < x$Time & as.integer(surv_group$Status) == 1,]
+      count <- sum(surv_group$Time[as.integer(surv_group$Status) == 1] < tmp1$Time[which.min(x$Time - tmp1$Time)])
+      prob <- 1 - count/nrow(surv_group)
+    }
+  }) %>% Reduce(f = c)
+  
+  survival_data$prob <- prob
+  
+  ##
+  survival_data <- (survival_data[,c("Time","Group","prob","Status")])
+  
+  survival_data <- rbind(data.frame(Time=rep(0,length(unique(survival_data$Group))),
+                                    Group=unique(survival_data$Group),
+                                    prob=rep(1,length(unique(survival_data$Group))),
+                                    Status=T
+                                    ),
+                         survival_data)
+  
+  
+  ggplot(data = survival_data) +
+    geom_step(aes(x = Time, y = prob,group=Group,colour = Group),size=1.3,show.legend=T)+
+    geom_point(aes(x = Time, y = prob,group=Group,colour = Group),size=2,data=survival_data[as.integer(survival_data$Status) == 0,],shape=3)+
+    coord_cartesian(ylim=c(0,1)) + 
+    labs(x=xlab,y=ylab,title = title)+
+    theme_bw() +
+    guides(color = guide_legend(title = ""), shape = guide_legend(title = "Group")) +
+    theme(
+      # panel.border = element_rect(colour = "black", fill=NA),
+          plot.title = element_text(size=15,color = "black",face = "bold"),
+          legend.position = "top",
+          axis.text.x = element_text(size = 15,color = "black"),
+          axis.text.y = element_text(size = 15,color = "black"),
+          axis.title = element_text(size = 15,color = "black",face = "bold"),
+          legend.text = element_text(size = 15),
+          panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_blank(),
+          axis.line = element_line(colour = "black")
+    )+
+    scale_color_manual(values = col)
+  
+}
+
+all_res <- result_score
+all_res <- all_res[which(all_res$Collection_Days > 0),]
+
+a <- lapply(unique(all_res$Sample.Source.ID), function(x){
+  tmp <- all_res[all_res$Sample.Source.ID %in% x,]
+  tmp$Sample.ID[which.min(tmp$Collection_Days)]
+}) %>% Reduce(f = c)
+
+all_res <- all_res[all_res$Sample.ID %in% a,]
+
+
+
+all_res$Group <- ifelse(all_res$qualitativeRisk %in% "high","Positive","Negative")
+# all_res$Time <- ifelse(is.na(all_res$recur_Days),all_res$last_collection_day,all_res$recur_Days)
+all_res$Time <- ifelse(is.na(all_res$recur_Days) & all_res$last_collection_day > 730,all_res$last_collection_day,
+                       ifelse(is.na(all_res$recur_Days) & all_res$last_collection_day <= 730,730,all_res$recur_Days))
+
+all_res$Status=(!is.na(all_res$recur_Days))
+# all_res$Risk <- all_res$predictedValue
+
+all_res$Group <- factor(all_res$Group,levels = c("Positive","Negative"))
+
+survival_curve_plot(survival_data= all_res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at 1st timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- all_res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- all_res$File.Name 
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = all_res,time_index = which(colnames(all_res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT- / PCT-")
+res <- all_res[all_res$ACT == 0 & all_res$PCT == 0,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at 1st timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name 
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT+ / PCT-")
+res <- all_res[all_res$ACT == 1 & all_res$PCT == 0,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at 1st timepoint",col = c("black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name 
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT- / PCT+")
+res <- all_res[all_res$ACT == 0 & all_res$PCT == 1,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at 1st timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name 
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT+ / PCT+")
+res <- all_res[all_res$ACT == 1 & all_res$PCT == 1,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at 1st timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+```
+
+
+### Overall sample positive and negative group
+
+```{r survival_all,  message=FALSE, warning=FALSE, include=T,fig.width=5,fig.height=4}
+
+all_res <- result_score
+all_res <- all_res[which(all_res$Collection_Days > 0),]
+
+
+all_res$qualitativeRisk <- lapply(all_res$Sample.Source.ID,function(x){
+  tmp <- all_res[all_res$Sample.Source.ID %in% x,]
+  tmp$qualitativeRisk <- ifelse(sum(tmp$qualitativeRisk %in% "high")>0,"Positive","Negative")
+}) %>% Reduce(f = c)
+
+all_res <- unique(all_res[,c("File.Name","Sample.Type","qualitativeRisk","Sample.Source.ID","recur_Days","last_collection_day","PFS","PCT","ACT")])
+
+
+all_res$Group <- all_res$qualitativeRisk
+# all_res$Time <- ifelse(is.na(all_res$recur_Days),all_res$last_collection_day,all_res$recur_Days);
+all_res$Time <- ifelse(is.na(all_res$recur_Days) & all_res$last_collection_day > 730,all_res$last_collection_day,
+                       ifelse(is.na(all_res$recur_Days) & all_res$last_collection_day <= 730,730,all_res$recur_Days))
+
+
+all_res$Status=(!is.na(all_res$recur_Days))
+
+all_res$Group <- factor(all_res$Group,levels = c("Positive","Negative"))
+
+survival_curve_plot(survival_data= all_res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at any timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+
+sam <- all_res[,"qualitativeRisk",drop=F]
+sam$qualitativeRisk <- ifelse(sam$qualitativeRisk %in% "Positive",1,0)
+rownames(sam) <- all_res$File.Name
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = all_res,time_index = which(colnames(all_res)=="Time"),status_index = 0,type = "cox"))
+
+
+
+
+## 
+cat("ACT- / PCT-")
+res <- all_res[all_res$ACT == 0 & all_res$PCT == 0,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at any timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT+ / PCT-")
+res <- all_res[all_res$ACT == 1 & all_res$PCT == 0,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at any timepoint",col = c("black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name 
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT- / PCT+")
+res <- all_res[all_res$ACT == 0 & all_res$PCT == 1,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at any timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name 
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+
+## 
+cat("ACT+ / PCT+")
+res <- all_res[all_res$ACT == 1 & all_res$PCT == 1,]
+survival_curve_plot(survival_data= res,xlab="Days after surgery",ylab="Relapse-free survival",title="status at any timepoint",col = c("red","black"))+
+  xlim(0,1250)
+
+sam <- res[,"Group",drop=F]
+sam$Group <- ifelse(sam$Group %in% "Positive",1,0)
+rownames(sam) <- res$File.Name
+
+markdown_dt_table(univar_pipeline_survival(sam = t(sam),injodr = res,time_index = which(colnames(res)=="Time"),status_index = 0,type = "cox"))
+```
+
+
+## Model score vs CEA per patient 
+
+### Relapsed patients
+
+
+```{r cea_all,  fig.height=10, fig.width=10, message=FALSE, warning=FALSE, include=T}
+
+injodr <- result_score
+cutoff=cv_model_feature$modelCore[[1]]$data$prediction$cutoff
+
+plot_data <- injodr[,c("Sample.ID","Patient.ID","Sample.Source.ID","predictedValue","qualitativeRisk","CEA","Collection_Days","ACT","PCT","recur_Days")]
+plot_data <- plot_data[!is.na(plot_data$recur_Days),]
+
+
+
+lead_time <- lapply(unique(plot_data$Patient.ID), function(x){
+  result <- plot_data[plot_data$Patient.ID %in% x  & plot_data$predictedValue > cutoff & plot_data$Collection_Days > 14,]
+  a <- as.numeric(result$recur_Days-result$Collection_Days)[which.max((result$recur_Days-result$Collection_Days)[which((result$recur_Days-result$Collection_Days)>0)])]
+  if(length(a) == 0)
+    return(data.frame(Patient.ID=x,Lead_time=NA))
+  else
+    return(data.frame(Patient.ID=x,Lead_time=a))
+}) %>% Reduce(f=rbind)
+lead_time <- na.omit(lead_time)
+
+
+coeff <- 80
+ggplot(data = plot_data,aes(x=Collection_Days)) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=5/coeff),fill='#EEF4F4')+
+  # geom_point( aes(y = predictedValue),size=2)+
+  geom_line( aes(y = predictedValue),method = "loess", se = FALSE,col="black",size=1)+
+  # geom_smooth(aes(y = predictedValue),method = "loess", se = FALSE,col="black",size=1)+
+  geom_point( aes(y = predictedValue),shape=21,size=3,fill ="#4A86C8")+
+  geom_point( aes(y = CEA/coeff),col="#01A6AA",size=3) +
+  geom_line( aes(y = CEA/coeff),col="#01A6AA",size=1) + 
+  scale_y_continuous(
+    name = "Model score",
+    sec.axis = sec_axis(~.*coeff, name="CEA")
+  )+
+  coord_cartesian(ylim = c(0, 1),xlim=c(NA,1300))+
+  geom_hline(yintercept=cutoff,linetype = "dashed")+
+  geom_vline(xintercept=0,linetype = "dashed")+
+  geom_vline(data = plot_data,aes(xintercept=as.numeric(recur_Days)),linetype = "dashed")+
+  theme(panel.border = element_rect(colour = "black", fill=NA),
+        panel.background = element_rect(fill = "white"),
+        legend.position = "right",
+        legend.direction = "vertical",
+        legend.justification = "center",
+        legend.background = element_rect(fill = "white", color = NA),
+        legend.key = element_rect(color = "gray", fill = "white"),
+        aspect.ratio = 1,
+        strip.text.x = element_text(size = rel(1.3), hjust = 0),
+        axis.text.x = element_text(size = 12,color = "black",face = "bold"),
+       axis.text.y = element_text(size = 12,color = "black",face = "bold"),
+       axis.title.x = element_text(size = 12,face = "bold"),
+       axis.title.y = element_text(size = 12,face = "bold"))+
+  labs(x="Days after surgery")+
+  geom_text(data=lead_time,aes(label = sprintf("Lead Time:
+                                               %s days",Lead_time),x=1200,y=0.9),vjust = "inward", hjust = "inward",color="#CA4B58")+
+  ggforce::facet_wrap_paginate(~Patient.ID,ncol=6,nrow=5)
+  # annotate(data = plot_data,"text", label = sprintf("lead time: %s days",Lead_time), x = 2, y = 15, size = 8, colour = "red")
+
+```
+
+
+### Non-relapsed patients
+
+
+
+```{r cea2_all,  fig.height=10, fig.width=15, message=FALSE, warning=FALSE, include=T}
+
+injodr <- result_score
+
+plot_data <- injodr[,c("Sample.ID","Patient.ID","Sample.Source.ID","predictedValue","CEA","Collection_Days","ACT","PCT","recur_Days")]
+plot_data <- plot_data[is.na(plot_data$recur_Days),]
+
+plot_data <- plot_data[!(plot_data$Sample.ID %in% c("TJ0220210SR00005" ,"TJ0220210SR00007")),]
+
+ncol <- 9; nrow <- 5
+
+nfeature <- length(unique(plot_data$Sample.Source.ID))-1
+npage <- ceiling(nfeature/(ncol*nrow))    
+nper_page <- ncol*nrow
+  
+plist <- lapply(seq(npage), function(i){
+    coeff <- 80
+    ggplot(data = plot_data[plot_data$Sample.Source.ID %in% unique(plot_data$Sample.Source.ID)[((i-1)*nper_page+1):((i-1)*nper_page+min(nfeature, nper_page))],],aes(x=Collection_Days)) +
+    geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=5/coeff),fill='#EEF4F4')+
+    # geom_point( aes(y = predictedValue),size=2)+
+    geom_line( aes(y = predictedValue),method = "loess", se = FALSE,col="black",size=1)+
+    # geom_smooth(aes(y = predictedValue),method = "loess", se = FALSE,col="black",size=1)+
+    geom_point( aes(y = predictedValue),shape=21,size=3,fill ="#4A86C8")+
+    geom_point( aes(y = CEA/coeff),col="#01A6AA",size=3) +
+    geom_line( aes(y = CEA/coeff),col="#01A6AA",size=1) + 
+    scale_y_continuous(
+      name = "Model score",
+      sec.axis = sec_axis(~.*coeff, name="CEA")
+    )+
+    geom_hline(yintercept=cutoff,linetype = "dashed")+
+    geom_vline(xintercept=0,linetype = "dashed")+
+    # geom_vline(data = plot_data,aes(xintercept=as.numeric(recur_Days)),linetype = "dashed")+
+    theme(panel.border = element_rect(colour = "black", fill=NA),
+          panel.background = element_rect(fill = "white"),
+          legend.position = "right",
+          legend.direction = "vertical",
+          legend.justification = "center",
+          legend.background = element_rect(fill = "white", color = NA),
+          legend.key = element_rect(color = "gray", fill = "white"),
+          aspect.ratio = 1,
+          strip.text.x = element_text(size = rel(1.3), hjust = 0),
+          axis.text.x = element_text(size = 12,color = "black",face = "bold"),
+         axis.text.y = element_text(size = 12,color = "black",face = "bold"),
+         axis.title.x = element_text(size = 12,face = "bold"),
+         axis.title.y = element_text(size = 12,face = "bold"))+
+    labs(x="Days after surgery")+
+  coord_cartesian(ylim = c(0, 1),xlim=c(NA,1300))+
+    # scale_x_continuous(breaks = round(Collection_Days))+
+    # geom_text(aes(label = sprintf("lead time: %s days",Lead_time),x=(max(Collection_Days)+(recur_Days-max(Collection_Days))*2/3),y=1.2),data = plot_data, vjust = "inward", hjust = "inward",color="#CA4B58")+
+    geom_text(aes(label = "",x=(max(Collection_Days)+(recur_Days-max(Collection_Days))*2/3),y=1.2))+
+    ggforce::facet_wrap_paginate(~Patient.ID,ncol=ncol,nrow=nrow)
+    # annotate(data = plot_data,"text", label = sprintf("lead time: %s days",Lead_time), x = 2, y = 15, size = 8, colour = "red")
+})
+
+g <- gridExtra::marrangeGrob(grobs = plist, ncol = 1, nrow = 1, top=NULL)
+g
+```
+
+
+## Sample collection and treatment chart
+
+```{r plot, fig.height=10, fig.width=5, message=FALSE, warning=FALSE}
+
+#######################################################################Sample collection date 
+sample_collect <- as.data.frame(read_excel("//172.16.1.31/mProbe.model/yjin/mprobe-model-ms/ColonCancer/20220228/sample_collect_20220225 James checked-updated_R211.xlsx",sheet = 1,col_names=T))
+sample_collect <- sample_collect[,c(1,2,3,5)]
+sample_collect$手术时间 <- gsub("T00:00:00Z","",sample_collect$手术时间)
+sample_collect$手术时间 <- as.Date(paste(sample_collect$手术时间), format("%Y-%m-%d"))
+sample_collect$日期 <- as.Date(paste(sample_collect$日期), format("%Y-%m-%d"))
+sample_collect$Collection_Days <- round(as.numeric(difftime(sample_collect$日期,sample_collect$手术时间, units = c("days"))),0)
+sample_collect$Collect_Number <- gsub("\\..*","",gsub("^(.*-)","",sample_collect$编号))                                                                          
+sample_collect$Collect_Number <- ifelse(grepl("R",sample_collect$Collect_Number)==T,"f",sample_collect$Collect_Number)      
+
+clean_data <- read_excel("//172.16.1.31/mProbe.model/yjin/mprobe-model-ms/ColonCancer/20220228/Recurrence_data_20220228.xlsx") %>% as.data.frame()
+clean_data <- clean_data[,c("Study#...1","NEW复发时间","手术时间","ACT","PCT",
+                            "术前化疗_start_date","术前化疗_end_date", 
+                            "术前放疗_start_date","术前放疗_end_date",
+                            "术后化疗_start_date","术后化疗_end_date",
+                            "术后放疗_start_date","术后放疗_end_date")]
+colnames(clean_data)[1] <- "Patient.ID"
+colnames(clean_data)[2] <- "复发时间"
+# colnames(clean_data)[3] <- "手术时间"
+
+clean_data$group <- paste(clean_data$ACT,clean_data$PCT,sep="|")
+clean_data$recur_Days <- as.numeric(difftime(clean_data$"复发时间" ,clean_data$"手术时间", units = c("days")))
+clean_data$recur_end_Days <- clean_data$recur_Days+2
+clean_data$"术前化疗_start_day" <- as.numeric(difftime(clean_data$"术前化疗_start_date",clean_data$"手术时间", units = "days"))
+clean_data$"术前化疗_end_day" <- as.numeric(difftime(clean_data$"术前化疗_end_date",clean_data$"手术时间", units = c("days")))
+clean_data$"术前放疗_start_day" <- as.numeric(difftime(clean_data$"术前放疗_start_date",clean_data$"手术时间", units = c("days")))
+clean_data$"术前放疗_end_day" <- as.numeric(difftime(clean_data$"术前放疗_end_date",clean_data$"手术时间", units = c("days")))
+clean_data$"术后化疗_start_day" <- as.numeric(difftime(clean_data$"术后化疗_start_date",clean_data$"手术时间", units = c("days")))
+clean_data$"术后化疗_end_day" <- as.numeric(difftime(clean_data$"术后化疗_end_date",clean_data$"手术时间", units = c("days")))
+clean_data$"术后放疗_start_day" <- as.numeric(difftime(clean_data$"术后放疗_start_date",clean_data$"手术时间", units = c("days")))
+clean_data$"术后放疗_end_day" <- as.numeric(difftime(clean_data$"术后放疗_end_date",clean_data$"手术时间", units = c("days")))
+
+#######################################################################Plot 
+sample_collect_data <- sample_collect %>% select(Patient.ID,Collect_Number,Collection_Days) %>% reshape(v.names="Collection_Days", timevar="Collect_Number", idvar="Patient.ID",direction="wide")
+plot_data <- merge(sample_collect_data,clean_data,by="Patient.ID",all.y=T) %>% as.tibble()
+plot_data$PCT <- ifelse(plot_data$Patient.ID=="R165",1,plot_data$PCT) #wrong pct 
+plot_data$group <- paste(plot_data$ACT,plot_data$PCT,sep="|")
+# openxlsx::write.xlsx(plot_data, "plot_data_20220221.xlsx", sheetName = "Sheet1",col.names = TRUE, row.names = FALSE,keepNA = FALSE) #download data and manual format
+
+# model_score <- merge(dataset_merge$injodr,result_score,by.x="File.Name",by.y=0)
+model_score <- result_score
+model_score <- model_score[,c("Patient.ID","Collection_Days","predictedValue","qualitativeRisk")]
+# model_score$qualitativeRisk <- ifelse(model_score$predictedValue >= 0.6,"high","low")
+plot_data <- as.data.frame(plot_data)
+
+plot_data$Collection_Days.0_score <- plot_data$Collection_Days.1_score <- plot_data$Collection_Days.2_score <- plot_data$Collection_Days.3_score <- plot_data$Collection_Days.4_score <- plot_data$Collection_Days.5_score <- plot_data$Collection_Days.6_score <- plot_data$Collection_Days.7_score <- NA
+
+
+
+for(i in 1:nrow(plot_data)){
+  x <- plot_data$Patient.ID[i]
+  tmp <- model_score[model_score$Patient.ID %in% x & model_score$qualitativeRisk %in% "high",]
+  if(nrow(tmp)>0)
+    plot_data[i,41:(41-nrow(tmp)+1)] <- as.numeric(tmp$Collection_Days)
+}
+
+w <- 0.7
+
+ggplot(data = plot_data[(plot_data$ACT == 0 & plot_data$PCT == 1),], aes(x = Patient.ID)) +
+  geom_bar(aes(y=recur_Days),stat="identity",alpha=0.5, fill="#EFD6FA", colour="grey", width=w)+
+  geom_crossbar(aes_string(y="术前化疗_start_day",ymin="术前化疗_start_day", ymax="术前化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术前放疗_start_day",ymin="术前放疗_start_day", ymax="术前放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w) +
+  geom_crossbar(aes_string(y="术后化疗_start_day",ymin="术后化疗_start_day", ymax="术后化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术后放疗_start_day",ymin="术后放疗_start_day", ymax="术后放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w)+
+  geom_crossbar(aes(y=recur_Days, ymin = recur_Days, ymax = recur_Days+2),width = 0.7, size=0, fill = "red", colour = "red") +
+  geom_point(aes(y=Collection_Days.f),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.0),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.2),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.3),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.4),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.5),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.6),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.7),shape = 1, colour = "black",size=2) +
+  
+  geom_point(aes(y=Collection_Days.0_score),shape = 16, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.2_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.3_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.4_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.5_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.6_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.7_score),shape = 16, colour = "black",size=2) +
+  
+  geom_hline(yintercept = 0, size=1, colour="#EB6CF1") +
+  ylab("Days after surgery") + 
+  xlab("") + 
+  ylim(c(min(as.numeric(plot_data$"术前化疗_start_day"), na.rm = T)-25,max(as.numeric(plot_data$recur_Days), na.rm = T))) +
+  theme_minimal()+
+  theme(panel.grid.major.x  =  element_blank(), panel.grid.minor = element_blank())+
+  theme(axis.line = element_line(colour = "black", size = 1, linetype = "solid"),
+        axis.text=element_text(size=10)) +
+  coord_flip() +
+  facet_grid(rows = ggplot2::vars(group), scales = "free_y", space = "free")
+
+```
+
+
+```{r plot2, fig.height=1.2, fig.width=5, message=FALSE, warning=FALSE}
+
+w <- 0.7
+
+ggplot(data = plot_data[(plot_data$ACT == 1 & plot_data$PCT == 0),], aes(x = Patient.ID)) +
+  geom_bar(aes(y=recur_Days),stat="identity",alpha=0.5, fill="#EFD6FA", colour="grey", width=w)+
+  geom_crossbar(aes_string(y="术前化疗_start_day",ymin="术前化疗_start_day", ymax="术前化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术前放疗_start_day",ymin="术前放疗_start_day", ymax="术前放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w) +
+  geom_crossbar(aes_string(y="术后化疗_start_day",ymin="术后化疗_start_day", ymax="术后化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术后放疗_start_day",ymin="术后放疗_start_day", ymax="术后放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w)+
+  geom_crossbar(aes(y=recur_Days, ymin = recur_Days, ymax = recur_Days+2),width = 0.7, size=0, fill = "red", colour = "red") +
+  geom_point(aes(y=Collection_Days.f),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.0),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.2),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.3),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.4),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.5),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.6),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.7),shape = 1, colour = "black",size=2) +
+  
+  geom_point(aes(y=Collection_Days.0_score),shape = 16, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.2_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.3_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.4_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.5_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.6_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.7_score),shape = 16, colour = "black",size=2) +
+  
+  geom_hline(yintercept = 0, size=1, colour="#EB6CF1") +
+  ylab("Days after surgery") + 
+  xlab("") + 
+  ylim(c(min(as.numeric(plot_data$"术前化疗_start_day"), na.rm = T)-25,max(as.numeric(plot_data$recur_Days), na.rm = T))) +
+  theme_minimal()+
+  theme(panel.grid.major.x  =  element_blank(), panel.grid.minor = element_blank())+
+  theme(axis.line = element_line(colour = "black", size = 1, linetype = "solid"),
+        axis.text=element_text(size=10)) +
+  coord_flip() +
+  facet_grid(rows = ggplot2::vars(group), scales = "free_y", space = "free")
+
+
+
+```
+
+
+```{r plot3, fig.height=4.5, fig.width=5, message=FALSE, warning=FALSE}
+
+w <- 0.7
+
+ggplot(data = plot_data[(plot_data$ACT == 1 & plot_data$PCT == 1),], aes(x = Patient.ID)) +
+  geom_bar(aes(y=recur_Days),stat="identity",alpha=0.5, fill="#EFD6FA", colour="grey", width=w)+
+  geom_crossbar(aes_string(y="术前化疗_start_day",ymin="术前化疗_start_day", ymax="术前化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术前放疗_start_day",ymin="术前放疗_start_day", ymax="术前放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w) +
+  geom_crossbar(aes_string(y="术后化疗_start_day",ymin="术后化疗_start_day", ymax="术后化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术后放疗_start_day",ymin="术后放疗_start_day", ymax="术后放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w)+
+  geom_crossbar(aes(y=recur_Days, ymin = recur_Days, ymax = recur_Days+2),width = 0.7, size=0, fill = "red", colour = "red") +
+  geom_point(aes(y=Collection_Days.f),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.0),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.2),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.3),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.4),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.5),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.6),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.7),shape = 1, colour = "black",size=2) +
+  
+  geom_point(aes(y=Collection_Days.0_score),shape = 16, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.2_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.3_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.4_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.5_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.6_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.7_score),shape = 16, colour = "black",size=2) +
+  
+  geom_hline(yintercept = 0, size=1, colour="#EB6CF1") +
+  ylab("Days after surgery") + 
+  xlab("") + 
+  ylim(c(min(as.numeric(plot_data$"术前化疗_start_day"), na.rm = T)-25,max(as.numeric(plot_data$recur_Days), na.rm = T))) +
+  theme_minimal()+
+  theme(panel.grid.major.x  =  element_blank(), panel.grid.minor = element_blank())+
+  theme(axis.line = element_line(colour = "black", size = 1, linetype = "solid"),
+        axis.text=element_text(size=10)) +
+  coord_flip() +
+  facet_grid(rows = ggplot2::vars(group), scales = "free_y", space = "free")
+
+
+
+```
+
+```{r plot4, fig.height=10, fig.width=5, message=FALSE, warning=FALSE}
+
+ggplot(data = plot_data[(plot_data$ACT == 0 & plot_data$PCT == 0),], aes(x = Patient.ID)) +
+  geom_bar(aes(y=recur_Days),stat="identity",alpha=0.5, fill="#EFD6FA", colour="grey", width=w)+
+  geom_crossbar(aes_string(y="术前化疗_start_day",ymin="术前化疗_start_day", ymax="术前化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术前放疗_start_day",ymin="术前放疗_start_day", ymax="术前放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w) +
+  geom_crossbar(aes_string(y="术后化疗_start_day",ymin="术后化疗_start_day", ymax="术后化疗_end_day"), size=0, fill = "#077EEB", colour = NA, alpha=0.9, width=w) +
+  geom_crossbar(aes_string(y="术后放疗_start_day",ymin="术后放疗_start_day", ymax="术后放疗_end_day"), size=0, fill = "grey", colour = NA, alpha=0.5, width=w)+
+  geom_crossbar(aes(y=recur_Days, ymin = recur_Days, ymax = recur_Days+2),width = 0.7, size=0, fill = "red", colour = "red") +
+  geom_point(aes(y=Collection_Days.f),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.0),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.2),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.3),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.4),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.5),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.6),shape = 1, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.7),shape = 1, colour = "black",size=2) +
+  
+  geom_point(aes(y=Collection_Days.0_score),shape = 16, colour = "black",size=2) +
+  geom_point(aes(y=Collection_Days.1_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.2_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.3_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.4_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.5_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.6_score),shape = 16, colour = "black",size=2) +
+  # geom_point(aes(y=Collection_Days.7_score),shape = 16, colour = "black",size=2) +
+  
+  geom_hline(yintercept = 0, size=1, colour="#EB6CF1") +
+  ylab("Days after surgery") + 
+  xlab("") + 
+  ylim(c(min(as.numeric(plot_data$"术前化疗_start_day"), na.rm = T)-25,max(as.numeric(plot_data$recur_Days), na.rm = T))) +
+  theme_minimal()+
+  theme(panel.grid.major.x  =  element_blank(), panel.grid.minor = element_blank())+
+  theme(axis.line = element_line(colour = "black", size = 1, linetype = "solid"),
+        axis.text=element_text(size=10)) +
+  coord_flip() +
+  facet_grid(rows = ggplot2::vars(group), scales = "free_y", space = "free")
+
+```
+
+
+
+
+```{r save_data, message=FALSE, warning=FALSE}
+
+saveRDS(dataset_merge,file=paste0(model_meta$filename_prefix,"000_dataset_merge.rds"))
+save(list=ls(result_set), file=paste0(model_meta$filename_prefix,"000_result_set.rdata"), envir=result_set)
+
+# wb <- openxlsx::createWorkbook()
+# openxlsx::addWorksheet(wb, sheetName = "Summary")
+# # openxlsx::addWorksheet(wb, sheetName = "sam pathway")
+# openxlsx::addWorksheet(wb, sheetName = "sam - mom qc")
+# openxlsx::addWorksheet(wb, sheetName = "injection order")
+# openxlsx::addWorksheet(wb, sheetName = "univariate result-feature")
+# # openxlsx::addWorksheet(wb, sheetName = "univariate result-pathway")
+# 
+# 
+# openxlsx::writeData(wb, sheet = 1, t(data.frame(name=model_meta$name, 
+#                                                 data="",
+#                                                 inclusion="", 
+#                                                 exclusion="", 
+#                                                 platform=model_meta$platform, 
+#                                                 threshold=paste0("(Global univariate result) ",document_metric_criteria(uni_stat_obj$metric)))),rowNames = T, colNames =F)
+# # openxlsx::writeData(wb, sheet = 2, t(sam_path),rowNames = T)
+# openxlsx::writeData(wb, sheet = 2, t(dataset_merge$sam[feature_select,]),rowNames = T)
+# openxlsx::writeData(wb, sheet = 3, dataset_merge$injodr)
+# openxlsx::writeData(wb, sheet = 4,stat_feature_select,rowNames = T)
+# # openxlsx::writeData(wb, sheet = 5, uni_stat_path,rowNames = T)
+# 
+# openxlsx::saveWorkbook(wb, paste0(model_meta$filename_prefix,"009_biomarker_candidates.xlsx"), overwrite = TRUE)
+
+```
